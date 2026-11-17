@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS payments(
   disc INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', ts INTEGER);
 CREATE TABLE IF NOT EXISTS channels(
   id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, title TEXT, link TEXT);
+CREATE TABLE IF NOT EXISTS marketplace_accounts(
+  user INTEGER NOT NULL, platform TEXT NOT NULL, secret TEXT NOT NULL,
+  label TEXT NOT NULL DEFAULT '', updated INTEGER NOT NULL,
+  PRIMARY KEY(user, platform));
 """
 
 DEFAULT_TARIFFS = [
@@ -46,6 +50,11 @@ async def init():
         await _db.execute("ALTER TABLE payments ADD COLUMN invoice_id INTEGER DEFAULT 0")
     except Exception:
         pass
+    for column in ("receipt_file_id TEXT", "receipt_type TEXT"):
+        try:
+            await _db.execute(f"ALTER TABLE payments ADD COLUMN {column}")
+        except Exception:
+            pass
     await _db.commit()
     S.clear()
     for r in await q("SELECT key,value FROM settings"):
@@ -137,6 +146,26 @@ async def add_days(uid, days):
 async def add_balance(uid, amount, kind, note=""):
     await ex("UPDATE users SET balance=round(balance+?,2) WHERE id=?", (amount, uid))
     await ex("INSERT INTO tx(user,amount,kind,note,ts) VALUES(?,?,?,?,?)", (uid, amount, kind, note, int(time.time())))
+
+
+async def save_marketplace_account(uid, platform, encrypted_secret, label):
+    await ex(
+        "INSERT INTO marketplace_accounts(user,platform,secret,label,updated) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(user,platform) DO UPDATE SET secret=excluded.secret,label=excluded.label,updated=excluded.updated",
+        (uid, platform, encrypted_secret, label, int(time.time())),
+    )
+
+
+async def get_marketplace_accounts(uid):
+    return await q("SELECT platform,label,updated FROM marketplace_accounts WHERE user=? ORDER BY platform", (uid,))
+
+
+async def get_marketplace_secret(uid, platform):
+    return await one("SELECT secret,label FROM marketplace_accounts WHERE user=? AND platform=?", (uid, platform))
+
+
+async def delete_marketplace_account(uid, platform):
+    await ex("DELETE FROM marketplace_accounts WHERE user=? AND platform=?", (uid, platform))
 
 
 # ---------- платежи ----------

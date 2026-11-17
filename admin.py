@@ -42,7 +42,6 @@ def menu_kb():
         [G("✏️ Тексты", "a:texts"), G("🔘 Кнопки / эмодзи", "a:btns")],
         [G("👋 Приветствие", "a:text:welcome"), G("🔗 Ссылки", "a:links")],
         [G("💳 Тарифы и оплата", "a:money")],
-        [G("🔌 Подключение площадок", "a:marketplaces")],
         [G("📨 Рассылка", "a:ask:bcast"), G("📁 Экспорт", "a:export")],
         [IB(text="« Главное меню", callback_data="menu")],
     )
@@ -535,7 +534,10 @@ async def cb_pay(c: CallbackQuery):
         await notify(c.bot, p["user"], await t("pay_no", id=pid))
         mark = "❌ Отклонено"
     try:
-        await c.message.edit_text(c.message.html_text + f"\n\n<b>{mark}</b>")
+        if c.message.photo or c.message.document:
+            await c.message.edit_caption((c.message.html_text or c.message.caption or "") + f"\n\n<b>{mark}</b>")
+        else:
+            await c.message.edit_text(c.message.html_text + f"\n\n<b>{mark}</b>")
     except Exception:
         pass
     await c.answer(mark)

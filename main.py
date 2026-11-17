@@ -28,6 +28,7 @@ _me = {}
 class U(StatesGroup):
     promo = State()
     transfer = State()
+    receipt = State()
 
 
 def sub_status(u):
@@ -124,6 +125,7 @@ def main_kb(uid):
         [link_btn("news", "link_news"), link_btn("guide", "link_guide")],
         [link_btn("features", "link_features")],
         [B("free")],
+        [B("marketplaces")],
         [B("profile"), B("sub")],
     ]
     if uid == ADMIN_ID:
@@ -462,31 +464,79 @@ async def cb_chk_crypto(c: CallbackQuery):
 
 
 @r.callback_query(F.data.startswith("paid:"))
-async def cb_paid(c: CallbackQuery):
+async def cb_paid_state(c: CallbackQuery, state: FSMContext):
     i = int(c.data.split(":")[1])
-    tar = db.tariffs()[i]
+    tars = db.tariffs()
+    if i < 0 or i >= len(tars):
+        await c.answer("Тариф не найден. Откройте список тарифов заново.", show_alert=True)
+        return
     u = await db.get_user(c.from_user.id)
     pend = await db.one("SELECT id FROM payments WHERE user=? AND status='pending'", (u["id"],))
     if pend:
         await c.answer("У вас уже есть заявка на проверке ⏳", show_alert=True)
         return
+    await state.set_state(U.receipt)
+    await state.update_data(tariff_index=i)
+    await c.message.edit_text(
+        "📎 <b>Пришлите чек об оплате</b>\n\nОтправьте фото или PDF чека одним сообщением. "
+        "После получения бот передаст чек администратору на проверку.",
+        reply_markup=kb(back("sub")),
+    )
+    await c.answer()
+
+
+@r.message(U.receipt)
+async def in_receipt(m: Message, state: FSMContext):
+    if m.photo:
+        receipt_file_id, receipt_type = m.photo[-1].file_id, "photo"
+    elif m.document and (m.document.mime_type == "application/pdf" or (m.document.mime_type or "").startswith("image/")):
+        receipt_file_id, receipt_type = m.document.file_id, "document"
+    else:
+        await m.answer("Пришлите чек фотографией или файлом PDF/изображением.")
+        return
+
+    data = await state.get_data()
+    i = data.get("tariff_index")
+    tars = db.tariffs()
+    if not isinstance(i, int) or i < 0 or i >= len(tars):
+        await state.clear()
+        await m.answer("Срок оформления истёк. Начните оплату заново через меню подписки.")
+        return
+    u = await db.get_user(m.from_user.id)
+    pend = await db.one("SELECT id FROM payments WHERE user=? AND status='pending'", (u["id"],))
+    if pend:
+        await state.clear()
+        await m.answer("У вас уже есть заявка на проверке ⏳", reply_markup=kb(back()))
+        return
+
+    tar = tars[i]
     price = price_of(tar, u["discount"])
-    pid = await db.ex("INSERT INTO payments(user,days,price,disc,status,ts) VALUES(?,?,?,?,?,?)",
-                      (u["id"], tar["d"], price, u["discount"], "pending", int(time.time())))
+    pid = await db.ex(
+        "INSERT INTO payments(user,days,price,disc,status,ts,receipt_file_id,receipt_type) VALUES(?,?,?,?,?,?,?,?)",
+        (u["id"], tar["d"], price, u["discount"], "pending", int(time.time()), receipt_file_id, receipt_type),
+    )
     if u["discount"]:
         await db.ex("UPDATE users SET discount=0 WHERE id=?", (u["id"],))
-    await show(c, await t("pay_sent", id=pid), kb(back()))
-    await c.answer()
+    await state.clear()
     uname = f"@{u['username']}" if u["username"] else "—"
     try:
-        await c.bot.send_message(
-            ADMIN_ID,
+        caption = (
             f"💳 <b>Заявка на оплату #{pid}</b>\n\nПользователь: {esc(u['name'])} ({uname}) <code>{u['id']}</code>\n"
-            f"Тариф: {tar['t']} ({tar['d']} дн.)\nСумма: <b>{money(price)} ₽</b>",
-            reply_markup=kb([IB(text="✅ Подтвердить", callback_data=f"a:pok:{pid}"), IB(text="❌ Отклонить", callback_data=f"a:pno:{pid}")]),
+            f"Тариф: {esc(tar['t'])} ({tar['d']} дн.)\nСумма: <b>{money(price)} ₽</b>\n\nЧек приложен."
         )
+        markup = kb([IB(text="✅ Подтвердить", callback_data=f"a:pok:{pid}"), IB(text="❌ Отклонить", callback_data=f"a:pno:{pid}")])
+        if receipt_type == "photo":
+            await m.bot.send_photo(ADMIN_ID, receipt_file_id, caption=caption, reply_markup=markup)
+        else:
+            await m.bot.send_document(ADMIN_ID, receipt_file_id, caption=caption, reply_markup=markup)
     except Exception:
         logging.exception("notify admin")
+        await db.ex("UPDATE payments SET status='notify_error' WHERE id=?", (pid,))
+        if u["discount"]:
+            await db.ex("UPDATE users SET discount=? WHERE id=?", (u["discount"], u["id"]))
+        await m.answer("Не удалось передать чек администратору. Заявка отменена, попробуйте отправить чек ещё раз.", reply_markup=kb(back("sub")))
+        return
+    await m.answer(f"✅ Чек отправлен на проверку. Номер заявки: #{pid}.", reply_markup=kb(back()))
 
 
 # ---------------- запуск ----------------
