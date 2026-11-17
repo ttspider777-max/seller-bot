@@ -18,7 +18,7 @@ import marketplaces
 import user_panel
 import crypto
 import db
-from config import ADMIN_ID, BOT_TOKEN
+from config import ADMIN_ID, BOT_TOKEN, CRYPTO_TOKEN
 from texts import B, esc, money, t
 from util import TZ, fdate, kb, show
 
@@ -126,6 +126,7 @@ def main_kb(uid):
         [link_btn("news", "link_news"), link_btn("guide", "link_guide")],
         [link_btn("features", "link_features")],
         [B("free")],
+        [IB(text="🧩 Плагины", callback_data="userpanel:catalog"), IB(text="⚙️ Настройки", callback_data="userpanel:settings")],
         [B("profile"), B("sub")],
     ]
     if uid == ADMIN_ID:
@@ -394,7 +395,11 @@ async def cb_buy(c: CallbackQuery):
     price = price_of(tar, u["discount"])
     d = f" (скидка {u['discount']}%)" if u["discount"] else ""
     text = await t("pay_choose", tariff=tar["t"], price=money(price), disc=d, balance=money(u["balance"]))
-    await show(c, text, kb(B("pay_balance", f"payb:{i}"), B("pay_manual", f"paym:{i}"), B("pay_crypto", f"payc:{i}"), B("pay_stars", f"pays:{i}"), back("sub")))
+    methods = [B("pay_balance", f"payb:{i}"), B("pay_manual", f"paym:{i}")]
+    if CRYPTO_TOKEN:
+        methods.append(B("pay_crypto", f"payc:{i}"))
+    methods.append(back("sub"))
+    await show(c, text, kb(*methods))
     await c.answer()
 
 
@@ -407,12 +412,13 @@ async def cb_pay_bal(c: CallbackQuery):
     if u["balance"] < price:
         await c.answer(await t("pay_bal_no", price=money(price), balance=money(u["balance"])), show_alert=True)
         return
+    discount_used = u["discount"]
     await db.add_balance(u["id"], -price, "sub_pay", tar["t"])
     if u["discount"]:
         await db.ex("UPDATE users SET discount=0 WHERE id=?", (u["id"],))
     until = await db.add_days(u["id"], tar["d"])
     await db.ex("INSERT INTO payments(user,days,price,disc,status,ts) VALUES(?,?,?,?,?,?)",
-                (u["id"], tar["d"], price, u["discount"], "balance", int(time.time())))
+                (u["id"], tar["d"], price, discount_used, "balance", int(time.time())))
     await show(c, await t("pay_bal_ok", days=tar["d"], until=fdate(until)), kb(back()))
     await c.answer()
 
@@ -431,12 +437,7 @@ async def cb_pay_manual(c: CallbackQuery):
 
 @r.callback_query(F.data.startswith("pays:"))
 async def cb_pay_stars(c: CallbackQuery):
-    i = int(c.data.split(":")[1])
-    tar = db.tariffs()[i]
-    u = await db.get_user(c.from_user.id)
-    await show(c, await t("pay_stars", tariff=tar["t"], price=money(price_of(tar, u["discount"]))),
-               kb(B("support", url="https://t.me/apfov", title="✍️ Написать @apfov"), back(f"buy:{i}")))
-    await c.answer()
+    await c.answer("Оплата Telegram Stars пока не настроена. Выберите СБП или баланс.", show_alert=True)
 
 
 @r.callback_query(F.data.startswith("payc:"))

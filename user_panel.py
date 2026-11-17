@@ -11,7 +11,7 @@ from aiogram.types import (
 )
 
 import db
-from config import ADMIN_ID
+from config import ADMIN_ID, CRYPTO_TOKEN
 from texts import B, esc, t
 from util import show
 
@@ -37,6 +37,7 @@ def _main_kb(uid):
         [_link_button("news", "link_news"), _link_button("guide", "link_guide")],
         [_link_button("features", "link_features")],
         [B("free")],
+        [IB(text="🧩 Плагины", callback_data="userpanel:catalog"), IB(text="⚙️ Настройки", callback_data="userpanel:settings")],
         [B("profile"), B("sub")],
     ]
     if uid == ADMIN_ID:
@@ -57,13 +58,18 @@ async def _catalog(uid):
         rows.append([IB(text="Отключить плагин", callback_data="userpanel:plugin")])
     else:
         rows.append([IB(text="Включить плагин", callback_data="userpanel:plugin")])
+    rows.extend([
+        [IB(text="💎 Подписка и оплата", callback_data="sub"), IB(text="👤 Профиль", callback_data="profile")],
+        [IB(text="💲 Реферальная система", callback_data="refsys"), IB(text="🔥 Пробный период", callback_data="free")],
+    ])
     rows.append([IB(text="Настройки", callback_data="userpanel:settings")])
     text = (
         "🧩 <b>Каталог плагинов</b>\n\n"
         f"<b>Интеграции Playerok и Starvell</b> — {status}\n"
         f"Ваши аккаунты: Playerok — {playerok}; Starvell — {starvell}.\n"
         "Плагин подключает аккаунты и проверяет профиль. Для подключения нужна активная подписка.\n\n"
-        "🛠 <b>Автовыдача, автоподнятие, заказы и чаты</b> — пока в разработке; эти функции не включаются и не выполняются ботом."
+        "<b>Встроенные функции:</b> профиль и подписка, пробный период, промокоды, оплата и чеки СБП, рефералы и переводы баланса. "
+        + ("Crypto Pay подключён." if CRYPTO_TOKEN else "Crypto Pay появится после настройки токена в .env.")
     )
     return text, IKB(inline_keyboard=rows)
 
