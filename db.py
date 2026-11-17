@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS marketplace_accounts(
   user INTEGER NOT NULL, platform TEXT NOT NULL, secret TEXT NOT NULL,
   label TEXT NOT NULL DEFAULT '', updated INTEGER NOT NULL,
   PRIMARY KEY(user, platform));
+CREATE TABLE IF NOT EXISTS user_settings(
+  user INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+  PRIMARY KEY(user, key));
 """
 
 DEFAULT_TARIFFS = [
@@ -166,6 +169,19 @@ async def get_marketplace_secret(uid, platform):
 
 async def delete_marketplace_account(uid, platform):
     await ex("DELETE FROM marketplace_accounts WHERE user=? AND platform=?", (uid, platform))
+
+
+async def get_user_setting(uid, key, default="1"):
+    row = await one("SELECT value FROM user_settings WHERE user=? AND key=?", (uid, key))
+    return row["value"] if row else default
+
+
+async def set_user_setting(uid, key, value):
+    await ex(
+        "INSERT INTO user_settings(user,key,value) VALUES(?,?,?) "
+        "ON CONFLICT(user,key) DO UPDATE SET value=excluded.value",
+        (uid, key, str(value)),
+    )
 
 
 # ---------- платежи ----------

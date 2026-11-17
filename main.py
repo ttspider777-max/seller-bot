@@ -15,6 +15,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton as IB, InlineKeybo
 
 import admin
 import marketplaces
+import user_panel
 import crypto
 import db
 from config import ADMIN_ID, BOT_TOKEN
@@ -125,7 +126,6 @@ def main_kb(uid):
         [link_btn("news", "link_news"), link_btn("guide", "link_guide")],
         [link_btn("features", "link_features")],
         [B("free")],
-        [B("marketplaces")],
         [B("profile"), B("sub")],
     ]
     if uid == ADMIN_ID:
@@ -141,12 +141,14 @@ async def menu_text(user):
 async def start(m: Message, state: FSMContext):
     await state.clear()
     await m.answer(await menu_text(m.from_user), reply_markup=main_kb(m.from_user.id))
+    await m.answer("Быстрый доступ — на нижней панели 👇", reply_markup=user_panel.BOTTOM_PANEL)
 
 
 @r.callback_query(F.data == "menu")
 async def cb_menu(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await show(c, await menu_text(c.from_user), main_kb(c.from_user.id))
+    await c.message.answer("Быстрый доступ — на нижней панели 👇", reply_markup=user_panel.BOTTOM_PANEL)
     await c.answer()
 
 
@@ -166,6 +168,7 @@ async def cb_chk(c: CallbackQuery):
     except Exception:
         pass
     await c.message.answer(await menu_text(c.from_user), reply_markup=main_kb(c.from_user.id))
+    await c.message.answer("Быстрый доступ — на нижней панели 👇", reply_markup=user_panel.BOTTOM_PANEL)
 
 
 # ---------------- бесплатные дни ----------------
@@ -548,6 +551,7 @@ async def main():
     dp.message.outer_middleware(Gate())
     dp.callback_query.outer_middleware(Gate())
     dp.include_router(admin.r)
+    dp.include_router(user_panel.r)
     dp.include_router(marketplaces.r)
     dp.include_router(r)
     asyncio.create_task(crypto.poller(bot))

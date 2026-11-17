@@ -134,16 +134,18 @@ def _menu(uid, accounts):
 
 
 async def _has_access(uid: int) -> bool:
-    if uid == ADMIN_ID:
-        return True
-    return db.active(await db.get_user(uid))
+    subscribed = uid == ADMIN_ID or db.active(await db.get_user(uid))
+    enabled = await db.get_user_setting(uid, "plugin_marketplaces", "1") == "1"
+    return subscribed and enabled
 
 
 @r.callback_query(F.data == "marketplaces")
 async def show_marketplaces(c: CallbackQuery, state: FSMContext):
     await state.clear()
     if not await _has_access(c.from_user.id):
-        await c.answer("Для подключения площадок нужна активная подписка.", show_alert=True)
+        subscribed = c.from_user.id == ADMIN_ID or db.active(await db.get_user(c.from_user.id))
+        reason = "Для подключения площадок нужна активная подписка." if not subscribed else "Плагин площадок отключён в настройках."
+        await c.answer(reason, show_alert=True)
         return
     text, markup = _menu(c.from_user.id, await db.get_marketplace_accounts(c.from_user.id))
     await show(c, text, markup)
@@ -153,8 +155,14 @@ async def show_marketplaces(c: CallbackQuery, state: FSMContext):
 @r.callback_query(F.data.startswith("mk:connect:"))
 async def begin_connect(c: CallbackQuery, state: FSMContext):
     platform = c.data.rsplit(":", 1)[-1]
-    if platform not in _PLATFORMS or not await _has_access(c.from_user.id):
-        await c.answer("Подключение недоступно. Проверьте подписку.", show_alert=True)
+    if platform not in _PLATFORMS:
+        await c.answer("Неизвестная площадка.", show_alert=True)
+        return
+    if c.from_user.id != ADMIN_ID and not db.active(await db.get_user(c.from_user.id)):
+        await c.answer("Для подключения площадок нужна активная подписка.", show_alert=True)
+        return
+    if await db.get_user_setting(c.from_user.id, "plugin_marketplaces", "1") != "1":
+        await c.answer("Сначала включите плагин площадок в настройках.", show_alert=True)
         return
     await state.set_state(Connection.waiting_for_cookie)
     await state.update_data(platform=platform)
