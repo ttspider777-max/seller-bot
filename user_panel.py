@@ -1,5 +1,6 @@
 """Persistent bottom navigation, plugin catalog, and personal settings."""
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery,
@@ -11,7 +12,9 @@ from aiogram.types import (
 )
 
 import db
-from config import ADMIN_ID, CRYPTO_TOKEN
+from config import ADMIN_ID
+from marketplaces import PLATFORMS
+from menu_widget import send_menu
 from texts import B, esc, t
 from util import show
 
@@ -19,7 +22,7 @@ r = Router()
 BOTTOM_PANEL = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🧩 Плагины"), KeyboardButton(text="⚙️ Настройки")],
-        [KeyboardButton(text="🏠 Меню")],
+        [KeyboardButton(text="🏠 Меню", style="success")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -32,46 +35,45 @@ def _link_button(key, setting):
     return B(key, url=url) if url else B(key, "nolink")
 
 
-def _main_kb(uid):
+def main_kb(uid):
     rows = [
-        [_link_button("news", "link_news"), _link_button("guide", "link_guide")],
-        [_link_button("features", "link_features")],
-        [B("free")],
-        [IB(text="🧩 Плагины", callback_data="userpanel:catalog"), IB(text="⚙️ Настройки", callback_data="userpanel:settings")],
-        [B("profile"), B("sub")],
+        [B("plugin_catalog", "userpanel:catalog")],
+        [B("profile"), B("help_menu")],
     ]
     if uid == ADMIN_ID:
         rows.append([B("admin", "a:menu")])
     return IKB(inline_keyboard=rows)
 
 
-async def _catalog(uid):
-    enabled = await db.get_user_setting(uid, "plugin_marketplaces", "1") == "1"
-    accounts = await db.get_marketplace_accounts(uid)
-    connected = {x["platform"] for x in accounts}
-    playerok = "подключён" if "playerok" in connected else "не подключён"
-    starvell = "подключён" if "starvell" in connected else "не подключён"
-    status = "🟢 включён" if enabled else "⚪ выключен"
-    rows = []
-    if enabled:
-        rows.append([IB(text="Открыть подключение площадок", callback_data="marketplaces")])
-        rows.append([IB(text="Отключить плагин", callback_data="userpanel:plugin")])
-    else:
-        rows.append([IB(text="Включить плагин", callback_data="userpanel:plugin")])
-    rows.extend([
-        [IB(text="💎 Подписка и оплата", callback_data="sub"), IB(text="👤 Профиль", callback_data="profile")],
-        [IB(text="💲 Реферальная система", callback_data="refsys"), IB(text="🔥 Пробный период", callback_data="free")],
+async def menu_text(user):
+    return await t("welcome", name=esc(user.full_name), id=user.id,
+                   username=("@" + user.username) if user.username else "—")
+
+
+def help_view():
+    return IKB(inline_keyboard=[
+        [_link_button("news", "link_news"), _link_button("guide", "link_guide")],
+        [_link_button("features", "link_features"), _link_button("support", "link_support")],
+        [B("main_menu", "menu")],
     ])
-    rows.append([IB(text="Настройки", callback_data="userpanel:settings")])
-    text = (
-        "🧩 <b>Каталог плагинов</b>\n\n"
-        f"<b>Интеграции Playerok и Starvell</b> — {status}\n"
-        f"Ваши аккаунты: Playerok — {playerok}; Starvell — {starvell}.\n"
-        "Плагин подключает аккаунты и проверяет профиль. Для подключения нужна активная подписка.\n\n"
-        "<b>Встроенные функции:</b> профиль и подписка, пробный период, промокоды, оплата и чеки СБП, рефералы и переводы баланса. "
-        + ("Crypto Pay подключён." if CRYPTO_TOKEN else "Crypto Pay появится после настройки токена в .env.")
-    )
-    return text, IKB(inline_keyboard=rows)
+
+
+@r.callback_query(F.data == "help_menu")
+async def show_help(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show(c, "💬 <b>Помощь</b>\nВыберите раздел.", help_view())
+    await c.answer()
+
+
+def catalog_view():
+    icons = {"playerok": "🎮", "starvell": "⭐", "ggsel": "🛍"}
+    rows = [
+        [IB(text=f"{icons[key]} {name}", callback_data=f"mk:view:{key}", style="primary")
+         for key, name in PLATFORMS.items()],
+        [B("marketplaces")],
+        [B("main_menu", "menu")],
+    ]
+    return "Выберите площадку:", IKB(inline_keyboard=rows)
 
 
 async def _settings(uid):
@@ -81,7 +83,7 @@ async def _settings(uid):
     rows = [
         [IB(text=f"Реферальные уведомления: {'вкл' if ref_notifications else 'выкл'}", callback_data="userpanel:ref")],
         [IB(text=f"Плагин площадок: {'вкл' if plugin else 'выкл'}", callback_data="userpanel:plugin")],
-        [IB(text="Каталог плагинов", callback_data="userpanel:catalog")],
+        [B("plugin_catalog", "userpanel:catalog"), B("main_menu", "menu")],
     ]
     return "⚙️ <b>Настройки</b>\n\nЗдесь можно включать только доступные функции. Настройки применяются к вашему аккаунту.", IKB(inline_keyboard=rows)
 
@@ -89,7 +91,13 @@ async def _settings(uid):
 @r.message(F.text == "🧩 Плагины")
 async def show_catalog_message(m: Message, state: FSMContext):
     await state.clear()
-    text, markup = await _catalog(m.from_user.id)
+    await send_menu(m.bot, m.chat.id, *catalog_view())
+
+
+@r.message(Command("plugins"))
+async def show_catalog_command(m: Message, state: FSMContext):
+    await state.clear()
+    text, markup = catalog_view()
     await m.answer(text, reply_markup=markup)
 
 
@@ -100,23 +108,36 @@ async def show_settings_message(m: Message, state: FSMContext):
     await m.answer(text, reply_markup=markup)
 
 
+@r.message(Command("settings"))
+async def show_settings_command(m: Message, state: FSMContext):
+    await state.clear()
+    text, markup = await _settings(m.from_user.id)
+    await m.answer(text, reply_markup=markup)
+
+
 @r.message(F.text == "🏠 Меню")
 async def show_home_message(m: Message, state: FSMContext):
     await state.clear()
-    text = await t("welcome", name=esc(m.from_user.full_name), id=m.from_user.id,
-                   username=("@" + m.from_user.username) if m.from_user.username else "—")
-    await m.answer(text, reply_markup=_main_kb(m.from_user.id))
+    await send_menu(m.bot, m.chat.id, await menu_text(m.from_user), main_kb(m.from_user.id))
+
+
+@r.message(Command("menu"))
+async def show_home_command(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer(await menu_text(m.from_user), reply_markup=main_kb(m.from_user.id))
 
 
 @r.callback_query(F.data == "userpanel:catalog")
-async def show_catalog_callback(c: CallbackQuery):
-    text, markup = await _catalog(c.from_user.id)
+async def show_catalog_callback(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, markup = catalog_view()
     await show(c, text, markup)
     await c.answer()
 
 
 @r.callback_query(F.data == "userpanel:settings")
-async def show_settings_callback(c: CallbackQuery):
+async def show_settings_callback(c: CallbackQuery, state: FSMContext):
+    await state.clear()
     text, markup = await _settings(c.from_user.id)
     await show(c, text, markup)
     await c.answer()
@@ -126,7 +147,7 @@ async def show_settings_callback(c: CallbackQuery):
 async def toggle_marketplace_plugin(c: CallbackQuery):
     current = await db.get_user_setting(c.from_user.id, "plugin_marketplaces", "1")
     await db.set_user_setting(c.from_user.id, "plugin_marketplaces", "0" if current == "1" else "1")
-    text, markup = await _catalog(c.from_user.id)
+    text, markup = await _settings(c.from_user.id)
     await show(c, text, markup)
     await c.answer("Плагин отключён" if current == "1" else "Плагин включён")
 

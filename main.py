@@ -1,17 +1,19 @@
 import asyncio
 import logging
+import math
+import secrets
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton as IB, InlineKeyboardMarkup as KB, Message
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
+from aiogram.types import CallbackQuery, InlineKeyboardButton as IB, InlineKeyboardMarkup as KB
+from aiogram.types import LabeledPrice, Message, PreCheckoutQuery, WidgetQuery, WidgetQueryTypeData
 
 import admin
 import marketplaces
@@ -19,8 +21,10 @@ import user_panel
 import crypto
 import db
 from config import ADMIN_ID, BOT_TOKEN, CRYPTO_TOKEN
-from texts import B, esc, money, t
-from util import TZ, fdate, kb, show
+from menu_widget import send_menu
+from texts import B, btn_title, esc, money, t
+from user_panel import main_kb, menu_text
+from util import TZ, fdate, form_input, kb, show
 
 r = Router()
 _me = {}
@@ -47,7 +51,7 @@ def left_text(u):
 
 
 def back(to="menu"):
-    return B("back", to)
+    return B("main_menu" if to == "menu" else "back", to)
 
 
 # ---------------- middleware: бан, обязательная подписка, регистрация ----------------
@@ -57,7 +61,7 @@ async def unsubscribed(bot: Bot, uid):
         try:
             cid = int(c["chat_id"]) if c["chat_id"].lstrip("-").isdigit() else c["chat_id"]
             mb = await bot.get_chat_member(cid, uid)
-            if mb.status in ("left", "kicked"):
+            if mb.status in ("left", "kicked") or (mb.status == "restricted" and not mb.is_member):
                 res.append(c)
         except Exception:
             pass  # не можем проверить (бот не админ) — не блокируем
@@ -70,6 +74,9 @@ class Gate(BaseMiddleware):
         chat = event.chat if isinstance(event, Message) else (event.message.chat if event.message else None)
         if not user or (chat and chat.type != ChatType.PRIVATE):
             return
+        if isinstance(event, Message):
+            if event.successful_payment or (event.text or "").partition(" ")[0].split("@")[0] == "/paysupport":
+                return await handler(event, data)
         bot: Bot = data["bot"]
         u = await db.get_user(user.id)
         name = user.full_name or ""
@@ -78,7 +85,7 @@ class Gate(BaseMiddleware):
             ref = 0
             if isinstance(event, Message) and event.text and event.text.startswith("/start ref_"):
                 p = event.text.split("ref_", 1)[1].strip()
-                if p.isdigit() and int(p) != user.id and await db.get_user(int(p)):
+                if p.isascii() and p.isdigit() and len(p) <= 18 and int(p) != user.id and await db.get_user(int(p)):
                     ref = int(p)
             await db.ex("INSERT INTO users(id,name,username,joined,ref_by) VALUES(?,?,?,?,?)",
                         (user.id, name, uname, int(time.time()), ref))
@@ -114,42 +121,17 @@ class Gate(BaseMiddleware):
 
 
 # ---------------- главное меню ----------------
-def link_btn(key, setting):
-    url = db.gs(setting)
-    if url:
-        return B(key, url=url)
-    return B(key, "nolink")
-
-
-def main_kb(uid):
-    rows = [
-        [link_btn("news", "link_news"), link_btn("guide", "link_guide")],
-        [link_btn("features", "link_features")],
-        [B("free")],
-        [IB(text="🧩 Плагины", callback_data="userpanel:catalog"), IB(text="⚙️ Настройки", callback_data="userpanel:settings")],
-        [B("profile"), B("sub")],
-    ]
-    if uid == ADMIN_ID:
-        rows.append([B("admin", "a:menu")])
-    return KB(inline_keyboard=rows)
-
-
-async def menu_text(user):
-    return await t("welcome", name=esc(user.full_name), id=user.id, username=("@" + user.username) if user.username else "—")
-
-
 @r.message(CommandStart())
 async def start(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer(await menu_text(m.from_user), reply_markup=main_kb(m.from_user.id))
-    await m.answer("Быстрый доступ — на нижней панели 👇", reply_markup=user_panel.BOTTOM_PANEL)
+    await send_menu(m.bot, m.chat.id, await menu_text(m.from_user), main_kb(m.from_user.id),
+                    bottom_panel=user_panel.BOTTOM_PANEL)
 
 
 @r.callback_query(F.data == "menu")
 async def cb_menu(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await show(c, await menu_text(c.from_user), main_kb(c.from_user.id))
-    await c.message.answer("Быстрый доступ — на нижней панели 👇", reply_markup=user_panel.BOTTOM_PANEL)
     await c.answer()
 
 
@@ -168,20 +150,19 @@ async def cb_chk(c: CallbackQuery):
         await c.message.delete()
     except Exception:
         pass
-    await c.message.answer(await menu_text(c.from_user), reply_markup=main_kb(c.from_user.id))
-    await c.message.answer("Быстрый доступ — на нижней панели 👇", reply_markup=user_panel.BOTTOM_PANEL)
+    await send_menu(c.bot, c.from_user.id, await menu_text(c.from_user), main_kb(c.from_user.id),
+                    bottom_panel=user_panel.BOTTOM_PANEL)
 
 
 # ---------------- бесплатные дни ----------------
 @r.callback_query(F.data == "free")
-async def cb_free(c: CallbackQuery):
-    u = await db.get_user(c.from_user.id)
-    if u["trial_used"]:
+async def cb_free(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    days = db.trial_days()
+    until = await db.claim_trial(c.from_user.id, days)
+    if not until:
         await c.answer(await t("free_used"), show_alert=True)
         return
-    days = db.trial_days()
-    await db.ex("UPDATE users SET trial_used=1 WHERE id=?", (u["id"],))
-    until = await db.add_days(u["id"], days)
     await show(c, await t("free_ok", days=days, until=fdate(until)), kb(back()))
     await c.answer()
 
@@ -194,18 +175,73 @@ async def ref_numbers(uid):
 
 
 @r.callback_query(F.data == "profile")
-async def cb_profile(c: CallbackQuery):
-    u = await db.get_user(c.from_user.id)
+async def cb_profile(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show(c, *(await profile_view(c.from_user.id)))
+    await c.answer()
+
+
+async def profile_view(uid):
+    u = await db.get_user(uid)
     refs, _ = await ref_numbers(u["id"])
-    pay = await db.one("SELECT count(*) n, coalesce(sum(price),0) s FROM payments WHERE user=? AND status='ok'", (u["id"],))
+    pay = await db.one("SELECT count(*) n, coalesce(sum(price),0) s FROM payments WHERE user=? AND status IN ('ok','balance')", (u["id"],))
     text = await t(
         "profile", id=u["id"], name=esc(u["name"]), username=("@" + u["username"]) if u["username"] else "—",
         joined=fdate(u["joined"]), status=sub_status(u), left=left_text(u), purchases=pay["n"],
         spent=money(pay["s"]), discount=u["discount"], refs=refs, balance=money(u["balance"]),
         percent=money(db.ref_percent()),
     )
-    await show(c, text, kb([B("refsys"), B("promo")], B("sub"), back()))
-    await c.answer()
+    return text, kb([B("refsys"), B("promo")], [B("sub"), B("free")], back())
+
+
+@r.widget_query()
+async def widget_navigation(query: WidgetQuery, state: FSMContext | None = None):
+    uid = query.from_user.id
+    if not query.chat or query.chat.id != uid or query.chat.type != ChatType.PRIVATE:
+        await query.answer(data="Откройте личный чат с ботом.")
+        return
+    if not isinstance(query.type, WidgetQueryTypeData) or not query.data.startswith("nav:"):
+        await query.answer(data="Кнопка недоступна.")
+        return
+    user = await db.get_user(uid)
+    if not user or user["banned"]:
+        await query.answer(data="Доступ закрыт.")
+        return
+    if uid != ADMIN_ID and await unsubscribed(query.bot, uid):
+        await query.answer(data="Проверьте обязательную подписку через /start.")
+        return
+
+    _, action = query.data.split(":", 1)
+    platform = action.removeprefix("mk:view:")
+    if state is not None:
+        await state.clear()
+    if action == "menu":
+        content = await menu_text(query.from_user), main_kb(uid)
+    elif action == "userpanel:catalog":
+        content = user_panel.catalog_view()
+    elif action == "profile":
+        content = await profile_view(uid)
+    elif action == "help_menu":
+        content = "💬 <b>Помощь</b>\nВыберите раздел.", user_panel.help_view()
+    elif action == "marketplaces":
+        content = await marketplaces.accounts_view(uid)
+    elif action.startswith("mk:view:") and platform in marketplaces.PLATFORMS:
+        content = await marketplaces.platform_view(uid, platform)
+    elif action == "a:menu" and uid == ADMIN_ID:
+        content = "🛠 <b>Админ-панель</b>", admin.menu_kb()
+    else:
+        await query.answer(data="Раздел недоступен.")
+        return
+
+    text, markup = content
+    if markup is None:
+        await query.answer(data=text)
+        return
+    if action in ("menu", "userpanel:catalog"):
+        await send_menu(query.bot, uid, text, markup)
+    else:
+        await query.bot.send_message(uid, text, reply_markup=markup, disable_web_page_preview=True)
+    await query.answer()
 
 
 # ---------------- реферальная система ----------------
@@ -245,9 +281,12 @@ async def cb_ref_links(c: CallbackQuery):
 async def cb_ref_stats(c: CallbackQuery):
     uid = c.from_user.id
     refs, profit = await ref_numbers(uid)
-    paying = (await db.one("SELECT count(DISTINCT note) n FROM tx WHERE user=? AND kind='ref_bonus'", (uid,)))["n"]
+    paying = (await db.one(
+        "SELECT count(DISTINCT p.user) n FROM payments p JOIN users u ON u.id=p.user "
+        "WHERE u.ref_by=? AND p.status IN ('ok','balance')", (uid,),
+    ))["n"]
     active_refs = (await db.one("SELECT count(*) n FROM users WHERE ref_by=? AND sub_until>?", (uid, int(time.time()))))["n"]
-    today = int(datetime.now(TZ).replace(hour=0, minute=0, second=0).timestamp())
+    today = int(datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     td = (await db.one("SELECT coalesce(sum(amount),0) s FROM tx WHERE user=? AND kind='ref_bonus' AND ts>=?", (uid, today)))["s"]
     text = (
         "📊 <b>Статистика рефералов</b>\n\n<blockquote>"
@@ -306,24 +345,26 @@ async def cb_transfer(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
-@r.message(U.transfer, F.text)
+@r.message(U.transfer, F.text, form_input)
 async def in_transfer(m: Message, state: FSMContext):
-    parts = m.text.split()
     try:
-        to, amount = int(parts[0]), round(float(parts[1].replace(",", ".")), 2)
-    except Exception:
+        receiver, raw_amount = m.text.split()
+        to = int(receiver)
+        amount = round(float(raw_amount.replace(",", ".")), 2)
+        if not 0 < to < 2**63 or not math.isfinite(amount):
+            raise ValueError
+    except ValueError:
         await m.answer("Формат: <code>ID сумма</code>", reply_markup=kb(back("refsys")))
         return
     u = await db.get_user(m.from_user.id)
-    target = await db.get_user(to)
-    if not target or to == u["id"]:
-        await m.answer("❌ Получатель не найден (он должен запускать бота).", reply_markup=kb(back("refsys")))
+    result = await db.transfer(u["id"], to, amount)
+    if result != "ok":
+        reason = {
+            "target": "Получатель не найден или недоступен.",
+            "amount": "Проверьте сумму, баланс и ID получателя.",
+        }[result]
+        await m.answer(reason, reply_markup=kb(back("refsys")))
         return
-    if amount <= 0 or amount > u["balance"]:
-        await m.answer(f"❌ Некорректная сумма. Ваш баланс: {money(u['balance'])} ₽", reply_markup=kb(back("refsys")))
-        return
-    await db.add_balance(u["id"], -amount, "transfer_out", str(to))
-    await db.add_balance(to, amount, "transfer_in", str(u["id"]))
     await state.clear()
     await m.answer(f"✅ Переведено {money(amount)} ₽ пользователю {to}.", reply_markup=kb(back("refsys")))
     try:
@@ -340,28 +381,21 @@ async def cb_promo(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
-@r.message(U.promo, F.text)
+@r.message(U.promo, F.text, form_input)
 async def in_promo(m: Message, state: FSMContext):
     code = m.text.strip().upper()
-    p = await db.one("SELECT * FROM promos WHERE code=? AND active=1", (code,))
-    used = await db.one("SELECT 1 FROM promo_uses WHERE code=? AND user=?", (code, m.from_user.id))
-    if not p or used or (p["max_uses"] and p["used"] >= p["max_uses"]):
+    p = await db.redeem_promo(m.from_user.id, code)
+    if not p:
         await m.answer(await t("promo_bad"), reply_markup=kb(back("sub")))
         return
-    await db.ex("INSERT INTO promo_uses VALUES(?,?,?)", (code, m.from_user.id, int(time.time())))
-    await db.ex("UPDATE promos SET used=used+1 WHERE code=?", (code,))
     await state.clear()
-    if p["kind"] == "days":
-        await db.add_days(m.from_user.id, p["value"])
-        await m.answer(await t("promo_days", value=p["value"]), reply_markup=kb(back("sub")))
-    else:
-        await db.ex("UPDATE users SET discount=? WHERE id=?", (p["value"], m.from_user.id))
-        await m.answer(await t("promo_disc", value=p["value"]), reply_markup=kb(back("sub")))
+    key = "promo_days" if p["kind"] == "days" else "promo_disc"
+    await m.answer(await t(key, value=p["value"]), reply_markup=kb(back("sub")))
 
 
 # ---------------- подписка ----------------
 def price_of(tar, disc):
-    return round(tar["p"] * (100 - disc) / 100, 2)
+    return db.price_for(tar, disc)
 
 
 def tar_btn_text(tar, disc=0):
@@ -377,189 +411,313 @@ async def cb_sub(c: CallbackQuery, state: FSMContext):
     lines = []
     for i, x in enumerate(tars):
         pre = "┌" if i == 0 else ("└" if i == len(tars) - 1 else "├")
-        lines.append(f"{pre} 🔴 {x['t']} — {money(x['p'])} ₽" + (f" ({x['b']})" if x.get("b") else ""))
+        lines.append(f"{pre} {esc(x['t'])} · {money(price_of(x, u['discount']))} ₽" + (f" ({esc(x['b'])})" if x.get("b") else ""))
     disc = f"\n🎟 Ваша скидка: <b>{u['discount']}%</b>" if u["discount"] else ""
-    text = await t("sub_main", status=sub_status(u), id=u["id"], accounts=0, tariffs="\n".join(lines), discount_line=disc)
+    text = await t("sub_main", status=sub_status(u), id=u["id"], accounts=len(await db.get_marketplace_accounts(u["id"])), tariffs="\n".join(lines), discount_line=disc)
     rows = [[B("promo")]]
-    rows += [[IB(text=tar_btn_text(x, u["discount"]), callback_data=f"buy:{i}")] for i, x in enumerate(tars)]
+    manual = await db.one("SELECT id FROM payments WHERE user=? AND status='manual'", (u["id"],))
+    if manual:
+        rows.append([IB(text="Чек или реквизиты СБП", callback_data=f"resume:{manual['id']}", style="primary")])
+    if await db.one("SELECT 1 FROM payments WHERE user=? AND status='pending'", (u["id"],)):
+        text += "\n\nЧек на проверке."
+    rows += [[IB(text=tar_btn_text(x, u["discount"]), callback_data=f"buy:{i}", style="primary")] for i, x in enumerate(tars)]
     rows += [[B("free")], [B("refsys")], [back()]]
     await show(c, text, KB(inline_keyboard=rows))
     await c.answer()
 
 
-@r.callback_query(F.data.startswith("buy:"))
-async def cb_buy(c: CallbackQuery):
+@r.callback_query(F.data.regexp(r"^buy:\d{1,4}$"))
+async def cb_buy(c: CallbackQuery, state: FSMContext):
+    tariffs = db.tariffs()
     i = int(c.data.split(":")[1])
-    tar = db.tariffs()[i]
-    u = await db.get_user(c.from_user.id)
-    price = price_of(tar, u["discount"])
-    d = f" (скидка {u['discount']}%)" if u["discount"] else ""
-    text = await t("pay_choose", tariff=tar["t"], price=money(price), disc=d, balance=money(u["balance"]))
-    methods = [B("pay_balance", f"payb:{i}"), B("pay_manual", f"paym:{i}")]
+    if not 0 <= i < len(tariffs):
+        await c.answer("Тариф изменился. Откройте подписку заново.", show_alert=True)
+        return
+    tariff = tariffs[i]
+    user = await db.get_user(c.from_user.id)
+    discount = user["discount"]
+    price = price_of(tariff, discount)
+    stars_amount = max(1, math.ceil(price * db.stars_rate()))
+    nonce = secrets.token_urlsafe(8)
+    await state.clear()
+    await state.set_data({"quote": {"tariff": tariff, "discount": discount, "stars": stars_amount, "id": nonce}})
+    discount_text = f" (скидка {discount}%)" if discount else ""
+    text = await t("pay_choose", tariff=esc(tariff["t"]), price=money(price),
+                   disc=discount_text, balance=money(user["balance"]))
+    methods = [
+        B("pay_stars", f"pay:stars:{nonce}", title=f"{btn_title('pay_stars')} · {stars_amount} XTR"),
+        B("pay_balance", f"pay:balance:{nonce}"),
+    ]
+    if db.gs("t:requisites"):
+        methods.append(B("pay_manual", f"pay:manual:{nonce}"))
     if CRYPTO_TOKEN:
-        methods.append(B("pay_crypto", f"payc:{i}"))
-    methods.append(back("sub"))
-    await show(c, text, kb(*methods))
+        methods.append(B("pay_crypto", f"pay:crypto:{nonce}"))
+    await show(c, text, kb(*methods, back("sub")))
     await c.answer()
 
 
-@r.callback_query(F.data.startswith("payb:"))
-async def cb_pay_bal(c: CallbackQuery):
-    i = int(c.data.split(":")[1])
-    tar = db.tariffs()[i]
-    u = await db.get_user(c.from_user.id)
-    price = price_of(tar, u["discount"])
-    if u["balance"] < price:
-        await c.answer(await t("pay_bal_no", price=money(price), balance=money(u["balance"])), show_alert=True)
+@r.callback_query(F.data.regexp(r"^pay:(stars|balance|manual|crypto):[\w-]{11}$"))
+async def cb_payment(c: CallbackQuery, state: FSMContext):
+    _, method, nonce = c.data.split(":")
+    quote = (await state.get_data()).get("quote")
+    if not quote or quote["id"] != nonce:
+        await c.answer("Откройте тариф заново.", show_alert=True)
         return
-    discount_used = u["discount"]
-    await db.add_balance(u["id"], -price, "sub_pay", tar["t"])
-    if u["discount"]:
-        await db.ex("UPDATE users SET discount=0 WHERE id=?", (u["id"],))
-    until = await db.add_days(u["id"], tar["d"])
-    await db.ex("INSERT INTO payments(user,days,price,disc,status,ts) VALUES(?,?,?,?,?,?)",
-                (u["id"], tar["d"], price, discount_used, "balance", int(time.time())))
-    await show(c, await t("pay_bal_ok", days=tar["d"], until=fdate(until)), kb(back()))
+    if (method == "manual" and not db.gs("t:requisites")) or (method == "crypto" and not CRYPTO_TOKEN):
+        await c.answer("Способ оплаты недоступен.", show_alert=True)
+        return
+
+    tariff, discount = quote["tariff"], quote["discount"]
+    uid = c.from_user.id
+    stars = quote["stars"] if method == "stars" else None
+    status = "crypto_creating" if method == "crypto" else method
+    result, order = await db.reserve_payment(uid, tariff, discount, status,
+                                             request_key=nonce, stars_amount=stars)
+    if result != "ok":
+        error = {
+            "balance": "Недостаточно средств на внутреннем балансе.",
+            "pending": "У вас уже есть оплата СБП. Откройте её в разделе «Подписка».",
+            "used": "Этот заказ уже оформлен.",
+            "changed": "Условия оплаты изменились. Откройте тариф заново.",
+        }[result]
+        await c.answer(error, show_alert=True)
+        return
+    await state.clear()
+
+    if method == "balance":
+        _, ref, bonus = order
+        until = (await db.get_user(uid))["sub_until"]
+        await show(c, await t("pay_bal_ok", days=tariff["d"], until=fdate(until)), kb(back()))
+        await c.answer()
+        await crypto.notify_referrer(c.bot, ref, bonus)
+        return
+
     await c.answer()
+    price = price_of(tariff, discount)
+    if method == "manual":
+        text = await t("pay_manual", tariff=esc(tariff["t"]), price=money(price),
+                       requisites=await t("requisites"))
+        await show(c, text, manual_keyboard(order))
+        return
+    if method == "stars":
+        try:
+            await c.bot.send_invoice(
+                chat_id=uid, title="Подписка Seller Panel",
+                description=f"Доступ на {tariff['d']} дней",
+                payload=f"sub:{order}", currency="XTR", provider_token="",
+                prices=[LabeledPrice(label="Подписка", amount=stars)],
+                start_parameter=f"subscription-{order}",
+            )
+        except Exception:
+            await db.fail_payment(order, "stars", "notify_error")
+            await show(c, "Не удалось отправить счёт Stars. Откройте тариф заново.", kb(back("sub")))
+        return
 
-
-@r.callback_query(F.data.startswith("paym:"))
-async def cb_pay_manual(c: CallbackQuery):
-    i = int(c.data.split(":")[1])
-    tar = db.tariffs()[i]
-    u = await db.get_user(c.from_user.id)
-    price = price_of(tar, u["discount"])
-    req = await t("requisites")
-    text = await t("pay_manual", tariff=tar["t"], price=money(price), requisites=req)
-    await show(c, text, kb(B("paid", f"paid:{i}"), back(f"buy:{i}")))
-    await c.answer()
-
-
-@r.callback_query(F.data.startswith("pays:"))
-async def cb_pay_stars(c: CallbackQuery):
-    await c.answer("Оплата Telegram Stars пока не настроена. Выберите СБП или баланс.", show_alert=True)
-
-
-@r.callback_query(F.data.startswith("payc:"))
-async def cb_pay_crypto(c: CallbackQuery):
-    i = int(c.data.split(":")[1])
-    tar = db.tariffs()[i]
-    u = await db.get_user(c.from_user.id)
-    price = price_of(tar, u["discount"])
     try:
-        inv = await crypto.create_invoice(price, f"Подписка {tar['t']} (ID {u['id']})")
+        inv = await crypto.create_invoice(price, f"Подписка {tariff['t']} (ID {uid})")
+        url = inv.get("bot_invoice_url") or inv.get("pay_url")
+        if not url or not url.startswith("https://"):
+            raise ValueError("Missing Crypto Pay invoice URL")
+        await db.ex("UPDATE payments SET status='crypto',invoice_id=? WHERE id=? AND status='crypto_creating'",
+                    (int(inv["invoice_id"]), order))
     except Exception:
-        logging.exception("crypto")
-        await c.answer("Не удалось создать счёт, попробуйте позже", show_alert=True)
+        await db.fail_payment(order, "crypto_creating", "notify_error")
+        await show(c, "Не удалось создать счёт Crypto Pay. Откройте тариф заново.", kb(back("sub")))
         return
-    pid = await db.ex("INSERT INTO payments(user,days,price,disc,status,ts,invoice_id) VALUES(?,?,?,?,?,?,?)",
-                      (u["id"], tar["d"], price, u["discount"], "crypto", int(time.time()), inv["invoice_id"]))
-    url = inv.get("bot_invoice_url") or inv.get("pay_url")
-    await show(c, await t("pay_crypto", tariff=tar["t"], price=money(price)),
-               kb(B("pay_link", url=url), B("pay_check", f"chkc:{pid}"), back(f"buy:{i}")))
+    await show(c, await t("pay_crypto", tariff=esc(tariff["t"]), price=money(price)),
+               kb(B("pay_link", url=url), B("pay_check", f"chkc:{order}"), back("sub")))
+
+
+@r.callback_query(F.data.regexp(r"^(buy|payb|paym|pays|payc|paid):"))
+async def stale_payment_button(c: CallbackQuery):
+    await c.answer("Эта кнопка устарела. Откройте раздел «Подписка» заново.", show_alert=True)
+
+
+def stars_payment_id(payload):
+    prefix, _, raw_id = payload.partition(":")
+    if prefix == "sub" and raw_id.isascii() and raw_id.isdigit() and len(raw_id) <= 18:
+        return int(raw_id)
+    return None
+
+
+@r.pre_checkout_query()
+async def stars_pre_checkout(query: PreCheckoutQuery):
+    pid = stars_payment_id(query.invoice_payload)
+    ok = bool(pid and query.currency == "XTR" and
+              await db.approve_stars_checkout(pid, query.from_user.id, query.total_amount))
+    await query.answer(ok=ok, error_message=None if ok else "Счёт устарел. Откройте тариф заново.")
+
+
+@r.message(F.successful_payment)
+async def stars_success(m: Message):
+    payment = m.successful_payment
+    pid = stars_payment_id(payment.invoice_payload)
+    if not pid or payment.currency != "XTR":
+        return
+    result = await db.finish_payment(pid, "stars_checkout", uid=m.from_user.id,
+                                     charge_id=payment.telegram_payment_charge_id, stars_amount=payment.total_amount)
+    if result:
+        await crypto.notify_payment(m.bot, result)
+    elif not await db.one("SELECT 1 FROM payments WHERE charge_id=? AND user=?",
+                          (payment.telegram_payment_charge_id, m.from_user.id)):
+        logging.error("Unmatched Telegram Stars payment for order %s", pid)
+        await m.answer("Платёж получен Telegram. Напишите /paysupport и укажите номер заказа.")
+
+
+@r.message(Command("paysupport"))
+async def pay_support(m: Message, state: FSMContext):
+    await state.clear()
+    url = db.gs("link_support")
+    markup = kb(B("support", url=url), back("sub")) if url else kb(back("sub"))
+    await m.answer("Для вопросов по оплате укажите номер заказа и дату платежа. "
+                   + ("Напишите в поддержку." if url else f"Передайте данные администратору бота (ID {ADMIN_ID})."),
+                   reply_markup=markup)
+
+
+@r.callback_query(F.data.regexp(r"^chkc:\d{1,18}$"))
+async def cb_chk_crypto(c: CallbackQuery):
+    if not CRYPTO_TOKEN:
+        await c.answer("Crypto Pay сейчас недоступен.", show_alert=True)
+        return
+    try:
+        result = await crypto.check_and_confirm(c.bot, int(c.data.split(":")[1]), c.from_user.id)
+    except Exception:
+        result = "unavailable"
+    text = {
+        "paid": "Оплата подтверждена ✅",
+        "wait": "Оплата пока не найдена.",
+        "expired": "Срок оплаты истёк. Создайте новый счёт.",
+        "unavailable": "Не удалось проверить счёт. Попробуйте позже.",
+        "none": "Счёт не найден.",
+    }[result]
+    await c.answer(text, show_alert=True)
+
+
+def manual_keyboard(pid):
+    return kb(B("paid", f"receipt:{pid}"),
+              IB(text="Отменить неоплаченный счёт", callback_data=f"ask_cancel:{pid}"), back("sub"))
+
+
+@r.callback_query(F.data.regexp(r"^ask_cancel:\d{1,18}$"))
+async def ask_cancel_manual(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    pid = int(c.data.split(":")[1])
+    markup = kb(IB(text="Да, я не платил", callback_data=f"cancel_manual:{pid}", style="danger"),
+                IB(text="Вернуться к счёту", callback_data=f"resume:{pid}"))
+    await show(c, "Отменяйте счёт, только если ещё не переводили деньги.", markup)
     await c.answer()
 
 
-@r.callback_query(F.data.startswith("chkc:"))
-async def cb_chk_crypto(c: CallbackQuery):
-    res = await crypto.check_and_confirm(c.bot, int(c.data.split(":")[1]))
-    msg = {"paid": "✅ Оплачено!", "wait": "Оплата пока не найдена ⏳", "expired": "Счёт истёк, создайте новый"}.get(res, "Готово")
-    await c.answer(msg, show_alert=True)
-
-
-@r.callback_query(F.data.startswith("paid:"))
-async def cb_paid_state(c: CallbackQuery, state: FSMContext):
-    i = int(c.data.split(":")[1])
-    tars = db.tariffs()
-    if i < 0 or i >= len(tars):
-        await c.answer("Тариф не найден. Откройте список тарифов заново.", show_alert=True)
+@r.callback_query(F.data.regexp(r"^cancel_manual:\d{1,18}$"))
+async def cancel_manual(c: CallbackQuery, state: FSMContext):
+    pid = int(c.data.split(":")[1])
+    if not await db.fail_payment(pid, "manual", "cancelled", uid=c.from_user.id):
+        await c.answer("Счёт уже обработан.", show_alert=True)
         return
-    u = await db.get_user(c.from_user.id)
-    pend = await db.one("SELECT id FROM payments WHERE user=? AND status='pending'", (u["id"],))
-    if pend:
-        await c.answer("У вас уже есть заявка на проверке ⏳", show_alert=True)
+    await cb_sub(c, state)
+
+
+@r.callback_query(F.data.regexp(r"^resume:\d{1,18}$"))
+async def resume_manual(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    pid = int(c.data.split(":")[1])
+    p = await db.one("SELECT * FROM payments WHERE id=? AND user=? AND status='manual'", (pid, c.from_user.id))
+    if not p:
+        await c.answer("Счёт уже обработан.", show_alert=True)
+        return
+    text = await t("pay_manual", tariff=f"{p['days']} дн.", price=money(p["price"]), requisites=await t("requisites"))
+    await show(c, text, manual_keyboard(pid))
+    await c.answer()
+
+
+@r.callback_query(F.data.regexp(r"^receipt:\d{1,18}$"))
+async def cb_paid_state(c: CallbackQuery, state: FSMContext):
+    pid = int(c.data.split(":")[1])
+    if not await db.one("SELECT 1 FROM payments WHERE id=? AND user=? AND status='manual'", (pid, c.from_user.id)):
+        await c.answer("Счёт уже обработан.", show_alert=True)
         return
     await state.set_state(U.receipt)
-    await state.update_data(tariff_index=i)
-    await c.message.edit_text(
-        "📎 <b>Пришлите чек об оплате</b>\n\nОтправьте фото или PDF чека одним сообщением. "
-        "После получения бот передаст чек администратору на проверку.",
-        reply_markup=kb(back("sub")),
-    )
+    await state.set_data({"manual_id": pid})
+    await show(c, "📎 <b>Пришлите чек</b>\nОтправьте фото или PDF одним сообщением.", kb(back("sub")))
     await c.answer()
 
 
-@r.message(U.receipt)
+@r.message(U.receipt, form_input)
 async def in_receipt(m: Message, state: FSMContext):
     if m.photo:
-        receipt_file_id, receipt_type = m.photo[-1].file_id, "photo"
+        attachment, kind = m.photo[-1], "photo"
     elif m.document and (m.document.mime_type == "application/pdf" or (m.document.mime_type or "").startswith("image/")):
-        receipt_file_id, receipt_type = m.document.file_id, "document"
+        attachment, kind = m.document, "document"
     else:
-        await m.answer("Пришлите чек фотографией или файлом PDF/изображением.")
+        await m.answer("Пришлите фото или PDF чека.")
         return
-
-    data = await state.get_data()
-    i = data.get("tariff_index")
-    tars = db.tariffs()
-    if not isinstance(i, int) or i < 0 or i >= len(tars):
-        await state.clear()
-        await m.answer("Срок оформления истёк. Начните оплату заново через меню подписки.")
+    pid = (await state.get_data()).get("manual_id")
+    receipt = (attachment.file_id, kind, attachment.file_unique_id)
+    status, p = await db.attach_receipt(m.from_user.id, pid, receipt)
+    if status != "ok":
+        await m.answer({
+            "changed": "Счёт уже обработан.",
+            "pending": "У вас уже есть чек на проверке.",
+            "used": "Этот чек уже был подтверждён.",
+        }[status], reply_markup=kb(back("sub")))
         return
-    u = await db.get_user(m.from_user.id)
-    pend = await db.one("SELECT id FROM payments WHERE user=? AND status='pending'", (u["id"],))
-    if pend:
-        await state.clear()
-        await m.answer("У вас уже есть заявка на проверке ⏳", reply_markup=kb(back()))
-        return
-
-    tar = tars[i]
-    price = price_of(tar, u["discount"])
-    pid = await db.ex(
-        "INSERT INTO payments(user,days,price,disc,status,ts,receipt_file_id,receipt_type) VALUES(?,?,?,?,?,?,?,?)",
-        (u["id"], tar["d"], price, u["discount"], "pending", int(time.time()), receipt_file_id, receipt_type),
-    )
-    if u["discount"]:
-        await db.ex("UPDATE users SET discount=0 WHERE id=?", (u["id"],))
     await state.clear()
-    uname = f"@{u['username']}" if u["username"] else "—"
+    caption = (
+        f"💳 <b>Заявка #{pid}</b>\n"
+        f"Пользователь: {esc(m.from_user.full_name)} · <code>{m.from_user.id}</code>\n"
+        f"Подписка: {p['days']} дн. · <b>{money(p['price'])} ₽</b>"
+    )
+    markup = kb([IB(text="Подтвердить", callback_data=f"a:pok:{pid}", style="success"),
+                 IB(text="Отклонить", callback_data=f"a:pno:{pid}", style="danger")])
     try:
-        caption = (
-            f"💳 <b>Заявка на оплату #{pid}</b>\n\nПользователь: {esc(u['name'])} ({uname}) <code>{u['id']}</code>\n"
-            f"Тариф: {esc(tar['t'])} ({tar['d']} дн.)\nСумма: <b>{money(price)} ₽</b>\n\nЧек приложен."
-        )
-        markup = kb([IB(text="✅ Подтвердить", callback_data=f"a:pok:{pid}"), IB(text="❌ Отклонить", callback_data=f"a:pno:{pid}")])
-        if receipt_type == "photo":
-            await m.bot.send_photo(ADMIN_ID, receipt_file_id, caption=caption, reply_markup=markup)
-        else:
-            await m.bot.send_document(ADMIN_ID, receipt_file_id, caption=caption, reply_markup=markup)
+        send = m.bot.send_photo if kind == "photo" else m.bot.send_document
+        await send(ADMIN_ID, attachment.file_id, caption=caption, reply_markup=markup)
     except Exception:
-        logging.exception("notify admin")
-        await db.ex("UPDATE payments SET status='notify_error' WHERE id=?", (pid,))
-        if u["discount"]:
-            await db.ex("UPDATE users SET discount=? WHERE id=?", (u["discount"], u["id"]))
-        await m.answer("Не удалось передать чек администратору. Заявка отменена, попробуйте отправить чек ещё раз.", reply_markup=kb(back("sub")))
+        logging.warning("Unable to deliver receipt %s to admin", pid)
+        await m.answer(f"Чек #{pid} сохранён. Администратор сможет открыть его в очереди платежей.",
+                       reply_markup=kb(back("sub")))
         return
-    await m.answer(f"✅ Чек отправлен на проверку. Номер заявки: #{pid}.", reply_markup=kb(back()))
+    await m.answer(f"✅ Чек #{pid} отправлен на проверку.", reply_markup=kb(back("sub")))
+
+
+@r.callback_query()
+async def unavailable_button(c: CallbackQuery):
+    await c.answer("Этот раздел недоступен. Откройте меню через /start.", show_alert=True)
 
 
 # ---------------- запуск ----------------
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    await db.init()
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
+def build_dispatcher():
+    dp = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
     dp.message.outer_middleware(Gate())
     dp.callback_query.outer_middleware(Gate())
     dp.include_router(admin.r)
     dp.include_router(user_panel.r)
     dp.include_router(marketplaces.r)
     dp.include_router(r)
-    asyncio.create_task(crypto.poller(bot))
-    await bot.delete_webhook(drop_pending_updates=False)
-    me = await bot.get_me()
-    logging.info("Бот @%s запущен", me.username)
-    await dp.start_polling(bot)
+    return dp
+
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    if not BOT_TOKEN:
+        raise SystemExit("Укажите BOT_TOKEN в файле .env")
+    dp = build_dispatcher()
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    await db.init()
+    poller = None
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+        me = await bot.get_me()
+        logging.info("Бот @%s запущен", me.username)
+        if CRYPTO_TOKEN:
+            poller = asyncio.create_task(crypto.poller(bot))
+        await dp.start_polling(bot, close_bot_session=False)
+    finally:
+        if poller is not None:
+            poller.cancel()
+            await asyncio.gather(poller, return_exceptions=True)
+        await bot.session.close()
+        await db.close()
 
 
 if __name__ == "__main__":

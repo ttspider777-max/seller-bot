@@ -7,5 +7,6 @@ load_dotenv(BASE / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CRYPTO_TOKEN = os.getenv("CRYPTO_TOKEN", "")
-ADMIN_ID = 8717087613  # единственный владелец/админ
+ADMIN_ID = int(os.getenv("ADMIN_ID") or "8717087613")
+WIDGET_MENUS = os.getenv("WIDGET_MENUS", "1") != "0"
 DB_PATH = str(BASE / "data.db")

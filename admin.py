@@ -2,6 +2,8 @@ import asyncio
 import csv
 import io
 import logging
+import math
+import re
 import secrets
 import time
 
@@ -12,9 +14,10 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton as IB, InlineKeyboardMarkup as KB, Message
 
 import db
+from crypto import notify_payment
 from config import ADMIN_ID
-from texts import BUTTONS, TEXTS, B, btn_title, esc, money
-from util import fdate, kb, show
+from texts import BUTTONS, DEFAULT_BUTTON_STYLES, TEXTS, B, btn_title, esc, money, t
+from util import fdate, form_input, kb, show
 
 r = Router()
 r.message.filter(F.from_user.id == ADMIN_ID)
@@ -26,11 +29,11 @@ class A(StatesGroup):
 
 
 def home():
-    return IB(text="« В админ-панель", callback_data="a:menu")
+    return IB(text="« В админ-панель", callback_data="a:menu", style="success")
 
 
 def G(text, cb):
-    return IB(text=text, callback_data=cb, style="success")  # зелёная кнопка
+    return IB(text=text, callback_data=cb, style="primary")
 
 
 def menu_kb():
@@ -41,7 +44,7 @@ def menu_kb():
         [G("🎟 Промокоды", "a:promos"), G("📢 Обяз. подписка", "a:chans")],
         [G("✏️ Тексты", "a:texts"), G("🔘 Кнопки / эмодзи", "a:btns")],
         [G("👋 Приветствие", "a:text:welcome"), G("🔗 Ссылки", "a:links")],
-        [G("💳 Тарифы и оплата", "a:money")],
+        [G("💳 Тарифы", "a:money"), G("📎 Чеки СБП", "a:pending:0")],
         [G("📨 Рассылка", "a:ask:bcast"), G("📁 Экспорт", "a:export")],
         [IB(text="« Главное меню", callback_data="menu")],
     )
@@ -198,9 +201,14 @@ def prompt_for(act):
 @r.callback_query(F.data.startswith("a:ask:"))
 async def cb_ask(c: CallbackQuery, state: FSMContext):
     act = c.data[len("a:ask:"):]
+    try:
+        prompt = prompt_for(act)
+    except (IndexError, KeyError, ValueError):
+        await c.answer("Этот раздел больше недоступен.", show_alert=True)
+        return
     await state.set_state(A.inp)
     await state.update_data(act=act)
-    await show(c, prompt_for(act), kb([IB(text="✖️ Отмена", callback_data="a:menu")]))
+    await show(c, prompt, kb([IB(text="✖️ Отмена", callback_data="a:menu", style="danger")]))
     await c.answer()
 
 
@@ -232,7 +240,7 @@ async def notify(bot, uid, text):
         pass
 
 
-@r.message(A.inp)
+@r.message(A.inp, form_input)
 async def on_input(m: Message, state: FSMContext):
     act = (await state.get_data())["act"]
     base, _, arg = act.partition(":")
@@ -267,6 +275,8 @@ async def on_input(m: Message, state: FSMContext):
                 return await err("❌ Пользователь не найден.")
             if base in ("grant", "grant_u"):
                 days = int(rest[0])
+                if not 1 <= days <= 3650:
+                    raise ValueError
                 until = await db.add_days(uid, days)
                 await notify(m.bot, uid, f"🎁 Вам выдана подписка на <b>{days}</b> дн. Действует до <b>{fdate(until)}</b>.")
                 return await finish(f"✅ Выдано {days} дн. пользователю {uid}. Подписка до {fdate(until)}.")
@@ -278,7 +288,9 @@ async def on_input(m: Message, state: FSMContext):
                     return await finish(f"✅ Подписка пользователя {uid} полностью забрана.")
                 until = await db.add_days(uid, -days)
                 return await finish(f"✅ Забрано {days} дн. у {uid}. Теперь: {fdate(until) if until else 'нет подписки'}.")
-            amount = float(rest[0].replace(",", "."))
+            amount = round(float(rest[0].replace(",", ".")), 2)
+            if not math.isfinite(amount) or not 0 < abs(amount) <= 1_000_000:
+                raise ValueError
             await db.add_balance(uid, amount, "admin", "")
             return await finish(f"✅ Баланс {uid} изменён на {money(amount)} ₽.")
 
@@ -286,15 +298,23 @@ async def on_input(m: Message, state: FSMContext):
             code, kind, value, limit = txt.split()
             code = ("P" + secrets.token_hex(3)).upper() if code == "-" else code.upper()
             kind = {"days": "days", "дни": "days", "discount": "discount", "скидка": "discount", "percent": "discount"}.get(kind.lower())
-            if not kind or int(value) <= 0:
+            if (not re.fullmatch(r"[A-Z0-9_-]{1,32}", code) or not kind or
+                    not 1 <= int(value) <= (99 if kind == "discount" else 3650) or not 0 <= int(limit) <= 1_000_000):
                 raise ValueError
-            await db.ex("INSERT OR REPLACE INTO promos(code,kind,value,max_uses,used,active) VALUES(?,?,?,?,0,1)",
+            if await db.one("SELECT 1 FROM promos WHERE code=? UNION ALL SELECT 1 FROM promo_uses WHERE code=?", (code, code)):
+                return await err("Этот код уже использовался. Укажите другой.")
+            await db.ex("INSERT INTO promos(code,kind,value,max_uses,used,active) VALUES(?,?,?,?,0,1)",
                         (code, kind, int(value), int(limit)))
             return await finish(f"✅ Промокод <code>{code}</code> создан.", kb([IB(text="🎟 К промокодам", callback_data="a:promos")], home()))
 
         if base == "chan_add":
             ref = int(txt) if txt.lstrip("-").isdigit() else (txt if txt.startswith("@") else "@" + txt.split("/")[-1])
             chat = await m.bot.get_chat(ref)
+            member = await m.bot.get_chat_member(chat.id, m.bot.id)
+            if member.status not in ("administrator", "creator"):
+                return await err("Сначала назначьте бота администратором канала.")
+            if await db.one("SELECT 1 FROM channels WHERE chat_id=?", (str(chat.id),)):
+                return await err("Канал уже добавлен.")
             link = f"https://t.me/{chat.username}" if chat.username else None
             if not link:
                 try:
@@ -310,21 +330,25 @@ async def on_input(m: Message, state: FSMContext):
             return await finish("📨 Рассылка запущена, по окончании пришлю отчёт.")
 
         if base == "text":
-            if arg not in TEXTS:
+            if arg not in TEXTS or not txt or len(m.html_text) > 2500:
                 raise ValueError
             await db.set_s("t:" + arg, m.html_text)
             return await finish("✅ Текст сохранён.", kb([IB(text="✏️ К текстам", callback_data="a:texts")], home()))
 
         if base == "btn_name":
+            if arg not in BUTTONS or not 1 <= len(txt) <= 64:
+                raise ValueError
             await db.set_s("b:" + arg, txt)
             return await finish("✅ Название сохранено.", kb([IB(text="🔘 К кнопкам", callback_data="a:btns")], home()))
 
         if base == "btn_emo":
+            if arg not in BUTTONS:
+                raise ValueError
             if txt == "-":
                 await db.del_s("e:" + arg)
                 return await finish("✅ Эмодзи убрано.", kb([IB(text="🔘 К кнопкам", callback_data="a:btns")], home()))
             eid = custom_emoji_id(m)
-            if not eid:
+            if not eid or not eid.isascii() or not eid.isdigit() or len(eid) > 20:
                 return await err("❌ Не нашёл премиум-эмодзи в сообщении.")
             await db.set_s("e:" + arg, eid)
             return await finish(
@@ -334,6 +358,8 @@ async def on_input(m: Message, state: FSMContext):
             )
 
         if base == "link":
+            if arg not in dict(LINKS):
+                raise ValueError
             if txt == "-":
                 await db.del_s(arg)
             else:
@@ -343,14 +369,23 @@ async def on_input(m: Message, state: FSMContext):
             return await finish("✅ Ссылка сохранена.", kb([IB(text="🔗 К ссылкам", callback_data="a:links")], home()))
 
         if base == "set":
-            float(txt.replace(",", "."))
-            await db.set_s(arg, txt.replace(",", "."))
+            raw = txt.replace(",", ".")
+            low, high = {"trial_days": (1, 3650), "ref_percent": (0, 100), "stars_rate": (0.01, 10)}[arg]
+            value = int(raw) if arg == "trial_days" else float(raw)
+            if not low <= value <= high:
+                return await err(f"Введите значение от {low} до {high}.")
+            await db.set_s(arg, str(value))
             return await finish("✅ Сохранено.", kb([IB(text="💳 К тарифам", callback_data="a:money")], home()))
 
         if base == "tariff":
             parts = [p.strip() for p in txt.split("|")]
             tars = db.tariffs()
-            tars[int(arg)] = {"t": parts[0], "d": int(parts[1]), "p": float(parts[2].replace(",", ".")), "b": parts[3] if len(parts) > 3 else ""}
+            title, raw_days, raw_price, *badge_parts = parts
+            days, price = int(raw_days), round(float(raw_price.replace(",", ".")), 2)
+            badge = badge_parts[0] if badge_parts else ""
+            if not 1 <= len(title) <= 40 or not 1 <= days <= 3650 or not 0.01 <= price <= 1_000_000 or len(badge) > 20 or len(badge_parts) > 1:
+                raise ValueError
+            tars[int(arg)] = {"t": title, "d": days, "p": price, "b": badge}
             import json
             await db.set_s("tariffs", json.dumps(tars, ensure_ascii=False))
             return await finish("✅ Тариф сохранён.", kb([IB(text="💳 К тарифам", callback_data="a:money")], home()))
@@ -409,7 +444,9 @@ async def cb_cdel(c: CallbackQuery):
 
 # ---------- тексты ----------
 @r.callback_query(F.data == "a:texts")
-async def cb_texts(c: CallbackQuery):
+async def cb_texts(c: CallbackQuery, state: FSMContext | None = None):
+    if state is not None:
+        await state.clear()
     btns = [[IB(text=("✏️ " if db.gs("t:" + k) else "") + v[0], callback_data=f"a:text:{k}")] for k, v in TEXTS.items()]
     btns.append([home()])
     await show(c, "✏️ <b>Тексты бота</b>\nВыберите текст для редактирования (✏️ — уже изменён).", KB(inline_keyboard=btns))
@@ -429,7 +466,6 @@ async def cb_text(c: CallbackQuery, state: FSMContext):
 async def cb_treset(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await db.del_s("t:" + c.data.split(":")[2])
-    await c.answer("Сброшено")
     await cb_texts(c)
 
 
@@ -446,7 +482,8 @@ async def cb_btns(c: CallbackQuery):
 async def cb_btn(c: CallbackQuery):
     key = c.data.split(":")[2]
     eid = db.gs("e:" + key)
-    col = {"success": "🟩 зелёная", "primary": "🟦 синяя", "danger": "🟥 красная"}.get(db.gs("s:" + key), "⬜ обычная")
+    default = DEFAULT_BUTTON_STYLES.get(key)
+    col = {"success": "🟩 зелёная", "primary": "🟦 синяя", "danger": "🟥 красная"}.get(db.gs("s:" + key, default), "⬜ обычная")
     await show(c, f"🔘 <b>{BUTTONS[key][0]}</b>\nНазвание: <b>{esc(btn_title(key))}</b>\nЦвет: {col}\nПремиум-эмодзи: {('<code>' + eid + '</code>') if eid else 'нет'}",
                kb([IB(text="📝 Название", callback_data=f"a:ask:btn_name:{key}"), IB(text="😀 Премиум-эмодзи", callback_data=f"a:ask:btn_emo:{key}")],
                   [IB(text="🟩 Зелёная", callback_data=f"a:bcol:{key}:success"), IB(text="🟦 Синяя", callback_data=f"a:bcol:{key}:primary"),
@@ -458,13 +495,11 @@ async def cb_btn(c: CallbackQuery):
 @r.callback_query(F.data.startswith("a:bcol:"))
 async def cb_bcol(c: CallbackQuery):
     _, _, key, val = c.data.split(":")
-    if val == "none":
-        await db.del_s("s:" + key)
-    else:
-        await db.set_s("s:" + key, val)
-    await c.answer("Цвет сохранён")
-    c.data = f"a:btn:{key}"
-    await cb_btn(c)
+    if key not in BUTTONS or val not in ("none", "success", "primary", "danger"):
+        await c.answer("Неизвестный цвет.", show_alert=True)
+        return
+    await db.set_s("s:" + key, val)
+    await cb_btn(c.model_copy(update={"data": f"a:btn:{key}"}))
 
 
 @r.callback_query(F.data.startswith("a:breset:"))
@@ -473,7 +508,6 @@ async def cb_breset(c: CallbackQuery):
     await db.del_s("b:" + key)
     await db.del_s("e:" + key)
     await db.del_s("s:" + key)
-    await c.answer("Сброшено")
     await cb_btns(c)
 
 
@@ -499,6 +533,7 @@ async def cb_money(c: CallbackQuery):
     btns += [
         [IB(text=f"👥 Реф. процент: {money(db.ref_percent())}%", callback_data="a:ask:set:ref_percent")],
         [IB(text=f"🔥 Дней пробного периода: {db.trial_days()}", callback_data="a:ask:set:trial_days")],
+        [IB(text=f"⭐ Stars за 1 ₽: {money(db.stars_rate())}", callback_data="a:ask:set:stars_rate")],
         [IB(text="💳 Реквизиты для оплаты", callback_data="a:text:requisites")],
         [home()],
     ]
@@ -507,6 +542,50 @@ async def cb_money(c: CallbackQuery):
 
 
 # ---------- платежи ----------
+@r.callback_query(F.data.regexp(r"^a:pending:\d{1,6}$"))
+async def cb_pending(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    page = int(c.data.rsplit(":", 1)[-1])
+    orders = await db.q(
+        "SELECT id,user,price FROM payments WHERE status='pending' ORDER BY id LIMIT 11 OFFSET ?",
+        (page * 10,),
+    )
+    rows = [[IB(text=f"#{p['id']} · {p['user']} · {money(p['price'])} ₽",
+                callback_data=f"a:receipt:{p['id']}", style="primary")] for p in orders[:10]]
+    navigation = []
+    if page:
+        navigation.append(IB(text="« Назад", callback_data=f"a:pending:{page-1}"))
+    if len(orders) > 10:
+        navigation.append(IB(text="Вперёд »", callback_data=f"a:pending:{page+1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.append([home()])
+    note = "Выберите заявку." if orders else "На этой странице заявок нет."
+    await show(c, f"📎 <b>Чеки СБП</b>\n{note}", KB(inline_keyboard=rows))
+    await c.answer()
+
+
+@r.callback_query(F.data.regexp(r"^a:receipt:\d{1,18}$"))
+async def cb_receipt(c: CallbackQuery):
+    pid = int(c.data.rsplit(":", 1)[-1])
+    p = await db.one("SELECT * FROM payments WHERE id=? AND status='pending'", (pid,))
+    if not p:
+        await c.answer("Заявка уже обработана.", show_alert=True)
+        return
+    markup = kb(
+        [IB(text="Подтвердить", callback_data=f"a:pok:{pid}", style="success"),
+         IB(text="Отклонить", callback_data=f"a:pno:{pid}", style="danger")],
+        IB(text="К очереди", callback_data="a:pending:0"),
+    )
+    caption = f"<b>Заявка #{pid}</b>\nID {p['user']} · {p['days']} дн. · {money(p['price'])} ₽"
+    if p["receipt_file_id"] and p["receipt_type"] in ("photo", "document"):
+        send = c.bot.send_photo if p["receipt_type"] == "photo" else c.bot.send_document
+        await send(ADMIN_ID, p["receipt_file_id"], caption=caption, reply_markup=markup)
+    else:
+        await show(c, caption + "\nЧек к этой заявке не приложен.", markup)
+    await c.answer()
+
+
 @r.callback_query(F.data.regexp(r"^a:p(ok|no):\d+$"))
 async def cb_pay(c: CallbackQuery):
     _, act, pid = c.data.split(":")
@@ -515,27 +594,22 @@ async def cb_pay(c: CallbackQuery):
     if not p or p["status"] != "pending":
         await c.answer("Заявка уже обработана", show_alert=True)
         return
-    if act == "ok":
+    if act == "pok":
         res = await db.finish_payment(pid)
-        _, ref, bonus = res
-        u = await db.get_user(p["user"])
-        from texts import t
-        await notify(c.bot, p["user"], await t("pay_ok", days=p["days"], until=fdate(u["sub_until"])))
-        if ref and bonus:
-            ru = await db.get_user(ref)
-            if ru and ru["notif"]:
-                await notify(c.bot, ref, f"💰 Реферал оплатил подписку: вам начислено <b>{money(bonus)} ₽</b>.")
+        if not res:
+            await c.answer("Заявка уже обработана.", show_alert=True)
+            return
+        await notify_payment(c.bot, res)
         mark = "✅ Подтверждено"
     else:
-        await db.ex("UPDATE payments SET status='rejected' WHERE id=?", (pid,))
-        if p["disc"]:
-            await db.ex("UPDATE users SET discount=? WHERE id=?", (p["disc"], p["user"]))
-        from texts import t
+        if not await db.fail_payment(pid, "pending", "rejected"):
+            await c.answer("Заявка уже обработана.", show_alert=True)
+            return
         await notify(c.bot, p["user"], await t("pay_no", id=pid))
         mark = "❌ Отклонено"
     try:
         if c.message.photo or c.message.document:
-            await c.message.edit_caption((c.message.html_text or c.message.caption or "") + f"\n\n<b>{mark}</b>")
+            await c.message.edit_caption(caption=(c.message.html_text or "") + f"\n\n<b>{mark}</b>", reply_markup=None)
         else:
             await c.message.edit_text(c.message.html_text + f"\n\n<b>{mark}</b>")
     except Exception:
@@ -550,7 +624,9 @@ async def cb_export(c: CallbackQuery):
     w = csv.writer(buf, delimiter=";")
     w.writerow(["id", "name", "username", "joined", "subscription_until", "banned", "balance", "ref_by"])
     for u in await db.q("SELECT * FROM users ORDER BY joined"):
-        w.writerow([u["id"], u["name"], u["username"], fdate(u["joined"], True), fdate(u["sub_until"]) if u["sub_until"] else "", u["banned"], u["balance"], u["ref_by"]])
+        name, username = [("'" + value if value.lstrip().startswith(("=", "+", "-", "@")) else value)
+                          for value in (u["name"] or "", u["username"] or "")]
+        w.writerow([u["id"], name, username, fdate(u["joined"], True), fdate(u["sub_until"]) if u["sub_until"] else "", u["banned"], u["balance"], u["ref_by"]])
     data = ("﻿" + buf.getvalue()).encode("utf-8")
     await c.message.answer_document(BufferedInputFile(data, "users.csv"), caption="📁 Все пользователи бота")
     await c.answer()

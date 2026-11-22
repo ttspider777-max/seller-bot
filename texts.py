@@ -8,10 +8,10 @@ from aiogram.types import InlineKeyboardButton
 TEXTS = {
     "welcome": (
         "Приветствие (/start и главное меню)",
-        "👋 Привет, <b>{name}</b>!\n\n"
-        "Подключайте аккаунты <b>Playerok</b> и <b>Starvell</b>, управляйте подпиской, оплатой и рефералами. "
-        "Доступные функции — в каталоге плагинов.\n\n"
-        "Выбери раздел ниже 👇",
+        "⚡ <b>Seller Panel</b>\n"
+        "Привет, <b>{name}</b>!\n"
+        "Playerok, Starvell и GGsel.\n"
+        "Выберите раздел:",
         "{name} {id} {username}",
     ),
     "profile": (
@@ -83,7 +83,7 @@ TEXTS = {
     ),
     "requisites": (
         "Текст реквизитов (вставляется в «Оплата по реквизитам»)",
-        "🏦 <b>СБП — Т-Банк</b>\n<code>+79161893553</code>\n\n⚠️ Реквизиты временные. В комментарии к переводу укажите свой ID.",
+        "Оплата по реквизитам пока недоступна.",
         "",
     ),
     "pay_stars": (
@@ -122,12 +122,13 @@ BUTTONS = {
     "news": ("Главное меню: Новости", "📰 Новости"),
     "guide": ("Главное меню: Инструкция", "📖 Инструкция"),
     "features": ("Главное меню: Функционал", "⚙️ Функционал"),
-    "free": ("Бесплатные 7 дней", "🔥 Бесплатные 7 дней подписки"),
+    "free": ("Пробный период", "🔥 Пробный период"),
     "profile": ("Профиль", "👤 Профиль"),
     "sub": ("Подписка", "💎 Подписка"),
-    "marketplaces": ("Подключение аккаунтов Playerok и Starvell", "🔌 Мои площадки"),
+    "marketplaces": ("Подключение аккаунтов площадок", "🔌 Мои аккаунты"),
     "admin": ("Админ-панель (видна только вам)", "🛠 Админ-панель"),
     "back": ("Назад", "« Назад"),
+    "main_menu": ("Главное меню", "Главное меню"),
     "promo": ("Промокод", "🎟 Промокод"),
     "refsys": ("Реф. система", "💲 Реф. система"),
     "ref_links": ("Реф: Мои ссылки", "🔗 Мои ссылки"),
@@ -146,6 +147,25 @@ BUTTONS = {
     "pay_check": ("Проверить оплату", "🔄 Проверить оплату"),
     "paid": ("Я оплатил", "✅ Я оплатил"),
     "check_sub": ("Проверить подписку", "✅ Проверить"),
+}
+
+
+BUTTONS.update({
+    "plugin_catalog": ("Каталог плагинов", "🧩 Площадки и плагины"),
+    "settings": ("Настройки", "⚙️ Настройки"),
+    "help_menu": ("Раздел помощи", "💬 Помощь"),
+})
+
+DEFAULT_BUTTON_STYLES = {
+    "plugin_catalog": "success",
+    "back": "success",
+    "main_menu": "success",
+    "marketplaces": "primary",
+    "sub": "primary",
+    "free": "success",
+    "pay_stars": "success",
+    "check_sub": "success",
+    "paid": "success",
 }
 
 
@@ -173,7 +193,7 @@ def B(key, cb=None, url=None, title=None):
         kw["url"] = url
     else:
         kw["callback_data"] = cb or key
-    st = db.gs("s:" + key)
+    st = db.gs("s:" + key, DEFAULT_BUTTON_STYLES.get(key, ""))
     if st in ("success", "primary", "danger"):
         kw["style"] = st  # цвет кнопки (Bot API 9.4)
     eid = db.gs("e:" + key)

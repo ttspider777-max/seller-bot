@@ -1,4 +1,4 @@
-aiogram>=3.15,<4
+aiogram>=3.32,<4
 aiosqlite>=0.20
 python-dotenv>=1.0
 PlayerokAPI>=0.2.0
