@@ -1,4 +1,5 @@
 import json
+import secrets
 import math
 import time
 from contextlib import asynccontextmanager
@@ -50,7 +51,8 @@ async def init():
     global _db
     _db = await aiosqlite.connect(DB_PATH)
     _db.row_factory = aiosqlite.Row
-    await _db.executescript(SCHEMA)
+    import offer_jobs, seller_events, fulfillment
+    await _db.executescript(SCHEMA + offer_jobs.SCHEMA + seller_events.SCHEMA + fulfillment.SCHEMA)
     await _db.execute("PRAGMA journal_mode=WAL")
     columns = {row["name"] for row in await q("PRAGMA table_info(payments)")}
     for column in ("invoice_id INTEGER DEFAULT 0", "receipt_file_id TEXT", "receipt_type TEXT",
@@ -250,11 +252,24 @@ async def redeem_promo(uid, code):
 
 
 async def save_marketplace_account(uid, platform, encrypted_secret, label):
-    await ex(
-        "INSERT INTO marketplace_accounts(user,platform,secret,label,updated) VALUES(?,?,?,?,?) "
-        "ON CONFLICT(user,platform) DO UPDATE SET secret=excluded.secret,label=excluded.label,updated=excluded.updated",
-        (uid, platform, encrypted_secret, label, int(time.time())),
-    )
+    async with transaction() as conn:
+        rows = await conn.execute_fetchall("SELECT platform,label FROM marketplace_accounts WHERE user=?", (uid,))
+        related = [row for row in rows if row["platform"].partition("/")[0] == platform]
+        existing = next((row for row in related if row["label"] == label), None)
+        if not existing and len(rows) >= 5:
+            raise AccountLimitError
+        key = existing["platform"] if existing else platform
+        if not existing and any(row["platform"] == platform for row in related):
+            key = platform + "/" + secrets.token_hex(6)
+        await conn.execute(
+            "INSERT INTO marketplace_accounts(user,platform,secret,label,updated) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(user,platform) DO UPDATE SET secret=excluded.secret,label=excluded.label,updated=excluded.updated",
+            (uid, key, encrypted_secret, label, int(time.time())),
+        )
+
+
+class AccountLimitError(ValueError):
+    pass
 
 
 async def get_marketplace_accounts(uid):
@@ -266,7 +281,11 @@ async def get_marketplace_secret(uid, platform):
 
 
 async def delete_marketplace_account(uid, platform):
-    await ex("DELETE FROM marketplace_accounts WHERE user=? AND platform=?", (uid, platform))
+    async with transaction() as conn:
+        await conn.execute("DELETE FROM plugin_orders WHERE link IN (SELECT id FROM plugin_links WHERE user=? AND slot=?)",(uid,platform))
+        await conn.execute("DELETE FROM plugin_links WHERE user=? AND slot=?",(uid,platform))
+        await conn.execute("DELETE FROM offer_jobs WHERE user=? AND slot=?", (uid, platform))
+        await conn.execute("DELETE FROM marketplace_accounts WHERE user=? AND platform=?", (uid, platform))
 
 
 async def get_user_setting(uid, key, default="1"):

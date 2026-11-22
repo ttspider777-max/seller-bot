@@ -8,6 +8,7 @@ from datetime import datetime
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -17,6 +18,7 @@ from aiogram.types import LabeledPrice, Message, PreCheckoutQuery, WidgetQuery, 
 
 import admin
 import marketplaces
+import fulfillment
 import user_panel
 import crypto
 import db
@@ -219,10 +221,24 @@ async def widget_navigation(query: WidgetQuery, state: FSMContext | None = None)
         content = await menu_text(query.from_user), main_kb(uid)
     elif action == "userpanel:catalog":
         content = user_panel.catalog_view()
+    elif action == "nolink":
+        await query.answer(data=await t("no_link"))
+        return
+    elif action == "sub":
+        content = await subscription_view(uid)
+    elif action == "free":
+        days = db.trial_days()
+        until = await db.claim_trial(uid, days)
+        if not until:
+            await query.answer(data=await t("free_used"))
+            return
+        content = await t("free_ok", days=days, until=fdate(until)), kb(back())
     elif action == "profile":
         content = await profile_view(uid)
     elif action == "help_menu":
         content = "💬 <b>Помощь</b>\nВыберите раздел.", user_panel.help_view()
+    elif action == "plugin_list":
+        content = await fulfillment.catalog(uid)
     elif action == "marketplaces":
         content = await marketplaces.accounts_view(uid)
     elif action.startswith("mk:view:") and platform in marketplaces.PLATFORMS:
@@ -406,7 +422,12 @@ def tar_btn_text(tar, disc=0):
 @r.callback_query(F.data == "sub")
 async def cb_sub(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    u = await db.get_user(c.from_user.id)
+    await show(c, *(await subscription_view(c.from_user.id)))
+    await c.answer()
+
+
+async def subscription_view(uid):
+    u = await db.get_user(uid)
     tars = db.tariffs()
     lines = []
     for i, x in enumerate(tars):
@@ -422,8 +443,7 @@ async def cb_sub(c: CallbackQuery, state: FSMContext):
         text += "\n\nЧек на проверке."
     rows += [[IB(text=tar_btn_text(x, u["discount"]), callback_data=f"buy:{i}", style="primary")] for i, x in enumerate(tars)]
     rows += [[B("free")], [B("refsys")], [back()]]
-    await show(c, text, KB(inline_keyboard=rows))
-    await c.answer()
+    return text, KB(inline_keyboard=rows)
 
 
 @r.callback_query(F.data.regexp(r"^buy:\d{1,4}$"))
@@ -692,6 +712,11 @@ def build_dispatcher():
     dp.callback_query.outer_middleware(Gate())
     dp.include_router(admin.r)
     dp.include_router(user_panel.r)
+    dp.include_router(fulfillment.r)
+    import offer_jobs, seller_events, seller_desk
+    dp.include_router(offer_jobs.r)
+    dp.include_router(seller_events.r)
+    dp.include_router(seller_desk.r)
     dp.include_router(marketplaces.r)
     dp.include_router(r)
     return dp
@@ -704,15 +729,30 @@ async def main():
     dp = build_dispatcher()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await db.init()
+    import seller_events
+    delivery = asyncio.create_task(fulfillment.worker())
+    watcher = asyncio.create_task(seller_events.monitor(bot))
     poller = None
     try:
-        await bot.delete_webhook(drop_pending_updates=False)
-        me = await bot.get_me()
+        delay = 2
+        while True:
+            try:
+                await bot.delete_webhook(drop_pending_updates=False)
+                me = await bot.get_me()
+                break
+            except TelegramNetworkError:
+                logging.warning("Telegram API недоступен. Следующая попытка через %s с.", delay)
+                await asyncio.sleep(delay)
+                delay = min(60, delay * 2)
         logging.info("Бот @%s запущен", me.username)
         if CRYPTO_TOKEN:
             poller = asyncio.create_task(crypto.poller(bot))
         await dp.start_polling(bot, close_bot_session=False)
     finally:
+        delivery.cancel()
+        await asyncio.gather(delivery, return_exceptions=True)
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
         if poller is not None:
             poller.cancel()
             await asyncio.gather(poller, return_exceptions=True)

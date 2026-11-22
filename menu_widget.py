@@ -36,6 +36,14 @@ for (const button of document.querySelectorAll('.menu button')) {
         feedback.textContent = '';
         button.disabled = true;
         try {
+            if (button.dataset.url) {
+                if (button.dataset.url.startsWith('https://t.me/')) {
+                    TelegramWidget.openTelegramLink(button.dataset.url);
+                } else {
+                    TelegramWidget.openLink(button.dataset.url);
+                }
+                return;
+            }
             const answer = await TelegramWidget.request(button.dataset.action);
             feedback.textContent = answer.result || '';
         } catch (error) {
@@ -54,9 +62,10 @@ def widget_html(text, markup):
         buttons = []
         for button in row:
             style = button.style if button.style in ("success", "primary", "danger") else ""
-            action = escape(f"nav:{button.callback_data}", quote=True)
+            target = (f'data-url="{escape(button.url, quote=True)}"' if button.url else
+                      f'data-action="{escape("nav:" + button.callback_data, quote=True)}"')
             buttons.append(
-                f'<button class="{style}" data-action="{action}">{escape(button.text)}</button>'
+                f'<button class="{style}" {target}>{escape(button.text)}</button>'
             )
         rows.append(f'<div class="row">{"".join(buttons)}</div>')
     return (

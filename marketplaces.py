@@ -138,23 +138,15 @@ async def _verify(platform: str, secret: str):
 
 
 def _menu(accounts):
-    by_platform = {row["platform"]: row["label"] for row in accounts}
     rows = []
-    for key, name in PLATFORMS.items():
-        if key in by_platform:
-            rows.append([IB(text=f"🔄 {name}", callback_data=f"mk:check:{key}", style="primary"),
-                         IB(text="Отключить", callback_data=f"mk:delete:{key}", style="danger")])
-        else:
-            rows.append([IB(text=f"➕ {name}", callback_data=f"mk:connect:{key}", style="primary")])
-    rows.append([IB(text="🧩 Плагины", callback_data="userpanel:catalog"),
-                 IB(text="Главное меню", callback_data="menu", style="success")])
-    labels = []
-    for key, name in PLATFORMS.items():
-        label = by_platform.get(key)
-        labels.append(f"{name}: 🟢 {escape(label)}" if label else f"{name}: ⚪ не подключён")
-    return "🔌 <b>Мои площадки</b>\n\n" + "\n".join(labels) + \
-        "\n\nДанные подключения хранятся в зашифрованном виде.", \
-        KB(inline_keyboard=rows)
+    for account in accounts:
+        key = account["platform"]
+        name = PLATFORMS[key.partition("/")[0]]
+        rows.append([IB(text=f"{name} · {account['label']}", callback_data=f"mk:check:{key}"),
+                     IB(text="Отключить", callback_data=f"mk:delete:{key}", style="danger")])
+    rows.append([IB(text=name, callback_data=f"mk:view:{key}") for key, name in PLATFORMS.items()])
+    rows.append([IB(text="Главное меню", callback_data="menu", style="success")])
+    return f"🔌 <b>Мои аккаунты</b>\nПодключено {len(accounts)} из 5.", KB(inline_keyboard=rows)
 
 
 async def _has_access(uid: int) -> bool:
@@ -196,22 +188,22 @@ async def view_platform(c: CallbackQuery, state: FSMContext):
 async def platform_view(uid, key):
     name = PLATFORMS[key]
     accounts = await db.get_marketplace_accounts(uid)
-    account = next((row for row in accounts if row["platform"] == key), None)
+    linked = [row for row in accounts if row["platform"].partition("/")[0] == key]
     buttons = []
+    for row in linked:
+        buttons.append([IB(text=f"🔄 {row['label']}", callback_data=f"mk:check:{row['platform']}"),
+                        IB(text="Отключить", callback_data=f"mk:delete:{row['platform']}", style="danger")])
+        if key in ("playerok", "starvell"):
+            slot = row["platform"]
+            buttons.append([IB(text="Заказы", callback_data=f"desk:orders:{slot}"), IB(text="Чаты", callback_data=f"desk:chats:{slot}")])
+            read = await db.get_user_setting(uid, "read:" + slot, "0")
+            buttons.append([IB(text="Отмечать прочитанным: " + ("да" if read == "1" else "нет"), callback_data=f"desk:read:{slot}")])
     if await _has_access(uid):
-        if account:
-            buttons.append([
-                IB(text="Проверить", callback_data=f"mk:check:{key}", style="primary"),
-                IB(text="Отключить", callback_data=f"mk:delete:{key}", style="danger"),
-            ])
-        else:
-            buttons.append([IB(text="Подключить", callback_data=f"mk:connect:{key}", style="success")])
+        buttons.append([IB(text="Подключить аккаунт", callback_data=f"mk:connect:{key}", style="success")])
     else:
         buttons.append([IB(text="Подписка", callback_data="sub"), IB(text="Настройки", callback_data="userpanel:settings")])
-        if account:
-            buttons.append([IB(text="Отключить", callback_data=f"mk:delete:{key}", style="danger")])
     buttons.append([IB(text="К площадкам", callback_data="userpanel:catalog", style="success")])
-    status = f"🟢 Подключено · {escape(account['label'])}" if account else "⚪ Не подключено"
+    status = f"Аккаунтов площадки: {len(linked)} · Всего {len(accounts)}/5"
     method = "Ключ Seller API v2" if key == "ggsel" else "Cookie своего аккаунта"
     return f"<b>{name}</b>\n{status}\nПодключение: {method}.", KB(inline_keyboard=buttons)
 
@@ -275,6 +267,10 @@ async def receive_cookie(m: Message, state: FSMContext):
             await m.answer("Подключение недоступно. Проверьте подписку и настройки.")
             return
         await db.save_marketplace_account(m.from_user.id, platform, _encrypt(secret), label)
+    except db.AccountLimitError:
+        await state.clear()
+        await m.answer("Уже подключено 5 аккаунтов. Отключите один в разделе «Мои аккаунты».")
+        return
     except Exception:
         await m.answer(
             f"Не удалось подключить {PLATFORMS[platform]}. Проверьте данные подключения и попробуйте снова.",
@@ -293,11 +289,11 @@ async def check_connection(c: CallbackQuery):
         return
     platform = c.data.rsplit(":", 1)[-1]
     account = await db.get_marketplace_secret(c.from_user.id, platform)
-    if not account or platform not in PLATFORMS:
+    if not account or platform.partition("/")[0] not in PLATFORMS:
         await c.answer("Аккаунт не подключён.", show_alert=True)
         return
     try:
-        label = await _verify(platform, _decrypt(account["secret"]))
+        label = await _verify(platform.partition("/")[0], _decrypt(account["secret"]))
         await db.ex(
             "UPDATE marketplace_accounts SET label=?,updated=? WHERE user=? AND platform=? AND secret=?",
             (label, int(time.time()), c.from_user.id, platform, account["secret"]),
@@ -312,7 +308,7 @@ async def check_connection(c: CallbackQuery):
 @r.callback_query(F.data.startswith("mk:delete:"))
 async def disconnect_account(c: CallbackQuery):
     platform = c.data.rsplit(":", 1)[-1]
-    if platform not in PLATFORMS:
+    if platform.partition("/")[0] not in PLATFORMS:
         await c.answer("Неизвестная площадка.", show_alert=True)
         return
     await db.delete_marketplace_account(c.from_user.id, platform)

@@ -37,8 +37,10 @@ def _link_button(key, setting):
 
 def main_kb(uid):
     rows = [
-        [B("plugin_catalog", "userpanel:catalog")],
-        [B("profile"), B("help_menu")],
+        [_link_button("news", "link_news"), _link_button("guide", "link_guide")],
+        [_link_button("features", "link_features")],
+        [B("free")],
+        [B("profile"), B("sub")],
     ]
     if uid == ADMIN_ID:
         rows.append([B("admin", "a:menu")])
@@ -71,6 +73,7 @@ def catalog_view():
         [IB(text=f"{icons[key]} {name}", callback_data=f"mk:view:{key}", style="primary")
          for key, name in PLATFORMS.items()],
         [B("marketplaces")],
+        [IB(text="🧩 Плагины продавца", callback_data="plugin_list")],
         [B("main_menu", "menu")],
     ]
     return "Выберите площадку:", IKB(inline_keyboard=rows)
@@ -85,7 +88,7 @@ async def _settings(uid):
         [IB(text=f"Плагин площадок: {'вкл' if plugin else 'выкл'}", callback_data="userpanel:plugin")],
         [B("plugin_catalog", "userpanel:catalog"), B("main_menu", "menu")],
     ]
-    return "⚙️ <b>Настройки</b>\n\nЗдесь можно включать только доступные функции. Настройки применяются к вашему аккаунту.", IKB(inline_keyboard=rows)
+    return "⚙️ <b>Настройки</b>\n\nКоманды продавца, правила и уведомления — /seller. Расписание для лотов — /offer.", IKB(inline_keyboard=rows)
 
 
 @r.message(F.text == "🧩 Плагины")

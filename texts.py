@@ -183,7 +183,8 @@ async def t(key, **kw):
 
 
 def btn_title(key):
-    return db.gs("b:" + key) or BUTTONS[key][1]
+    default = f"🔥 Бесплатные {db.trial_days()} дн." if key == "free" else BUTTONS[key][1]
+    return db.gs("b:" + key) or default
 
 
 def B(key, cb=None, url=None, title=None):
